@@ -183,7 +183,18 @@ export class RoomSession {
       newPeerId: () => newId(),
     });
 
-    const mesh = new RoomMesh({ roomId: options.roomId, passKey, self: identity, transport, rtc: defaultRtcFactory });
+    const mesh = new RoomMesh({
+      roomId: options.roomId,
+      passKey,
+      self: identity,
+      transport,
+      rtc: defaultRtcFactory,
+      // Диагностика P2P-слоя: паузы передачи из-за backpressure, таймауты
+      // подтверждений, состояние рукопожатия.
+      onTrace: (message) => {
+        console.debug('[rd/p2p]', message);
+      },
+    });
     const provider = new YRoomProvider({ mesh, doc: session.#doc.doc });
 
     const transfers = new FileTransferManager({
@@ -206,6 +217,11 @@ export class RoomSession {
       findPartial: (offer) => session.#store.partialBytes(options.roomId, offer.transferId),
       resolveSource: async (transferId) => null,
       onLog: (message) => session.#warn(message),
+      // Подробный журнал — только в консоль: пользователю сотни строк «чанк #47,
+      // буфер 120 КБ» не нужны, а при разборе зависшей передачи без них не обойтись.
+      onTrace: (message) => {
+        console.debug('[rd/передача]', message);
+      },
     });
 
     session.#parts = { identity, passKey, transport, mesh, provider, transfers };

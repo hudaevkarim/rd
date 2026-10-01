@@ -16,6 +16,7 @@
  */
 
 import type { IceCandidatePayload, PeerDescriptor, PeerId, RoomId, ServerMessage } from '@rd/protocol';
+import { uuidToBytes } from '@rd/protocol';
 import type { CtrlMessage } from '@rd/protocol';
 import type { PassKey, PeerIdentity } from '@rd/crypto';
 import { Emitter } from './emitter.js';
@@ -58,6 +59,8 @@ export interface RoomMeshOptions {
   pingIntervalMs?: number;
   /** Сколько неотвеченных пингов допускаем на пира, прежде чем перестать мерить. */
   maxPendingPings?: number;
+  /** Подробный журнал P2P-слоя: backpressure, рукопожатие, передача файлов. */
+  onTrace?(message: string): void;
 }
 
 type QueuedSignal =
@@ -87,6 +90,7 @@ export class RoomMesh {
   readonly #rtcConfig: RtcConfig;
   readonly #pingIntervalMs: number;
   readonly #maxPendingPings: number;
+  readonly #onTrace: ((message: string) => void) | undefined;
 
   readonly #peers = new Map<PeerId, PeerRecord>();
   readonly #queue = new Map<PeerId, QueuedSignal[]>();
@@ -106,6 +110,7 @@ export class RoomMesh {
     this.#rtcConfig = opts.rtcConfig ?? {};
     this.#pingIntervalMs = opts.pingIntervalMs ?? 5_000;
     this.#maxPendingPings = opts.maxPendingPings ?? 4;
+    this.#onTrace = opts.onTrace;
   }
 
   /** Идентификатор, присвоенный signaling-сервером этому подключению. */
@@ -309,6 +314,7 @@ export class RoomMesh {
       rtc: this.#rtc,
       rtcConfig: this.#rtcConfig,
       signal: (out) => this.#sendSignal(out),
+      onTrace: this.#onTrace,
     });
 
     link.events.on('state', () => this.#emitPeers());
@@ -414,9 +420,33 @@ export class RoomMesh {
     await link.sendFileChunk(transferIdRaw, offset, data);
   }
 
-  waitFileDrained(peerId: PeerId): Promise<void> {
+  /** Есть ли место в очереди файлового канала до пира. */
+  hasFileCapacity(peerId: PeerId): boolean {
     const link = this.#peers.get(peerId)?.link;
-    return link === undefined || link === null ? Promise.resolve() : link.waitFileDrained();
+    return link !== undefined && link !== null && link.hasFileCapacity;
+  }
+
+  /**
+   * Ждёт места в очереди файлового канала. Основа backpressure: без этого
+   * отправитель залил бы в канал весь файл за секунду.
+   * @returns false по таймауту или при закрытии.
+   */
+  waitFileCapacity(peerId: PeerId, timeoutMs: number, reason = ''): Promise<boolean> {
+    const link = this.#peers.get(peerId)?.link;
+    if (link === undefined || link === null) return Promise.resolve(false);
+    return link.waitFileCapacity(timeoutMs, reason);
+  }
+
+  /** Состояние очереди файлового канала — для журнала и панели «соединение». */
+  fileBufferOf(peerId: PeerId): { buffered: number; queued: number; high: number; low: number; waits: number } {
+    const link = this.#peers.get(peerId)?.link;
+    if (link === undefined || link === null) return { buffered: 0, queued: 0, high: 0, low: 0, waits: 0 };
+    return link.fileBuffer;
+  }
+
+  /** Подтверждение приёма чанков. Отдельный метод: см. комментарий в PeerLink. */
+  sendFileAck(peerId: PeerId, transferId: string, offset: number): void {
+    this.#peers.get(peerId)?.link?.sendFileAck(uuidToBytes(transferId), offset);
   }
 
   // ─── RTT ─────────────────────────────────────────────────────────────────────

@@ -43,6 +43,18 @@ export type CtrlMessage =
   | { k: 'file-decline'; transferId: TransferId; reason: string }
   /** Запрос докачки: отправитель начинает с `offset`. */
   | { k: 'file-resume'; transferId: TransferId; offset: number }
+  /**
+   * Кумулятивное подтверждение приёма: «всё до `offset` принято и записано».
+   *
+   * Отправитель держит скользящее окно по неподтверждённым данным, а не только
+   * по локальному буферу SCTP. Локальный буфер не знает, дошёл ли кадр до
+   * получателя: SCTP освобождает место, как только данные доставлены в сокет
+   * получателя, а не когда тот их записал в хранилище. Окно по ACK ограничивает
+   * память получателя и одновременно служит детектором зависания: если
+   * подтверждений нет дольше таймаута, передача считается вставшей и
+   * перезапускается с подтверждённого смещения.
+   */
+  | { k: 'file-ack'; transferId: TransferId; offset: number }
   | { k: 'file-finish'; transferId: TransferId; root: string }
   | { k: 'file-cancel'; transferId: TransferId; reason: string }
   /** Пир подтвердил, что сверил код безопасности с пользователем. */
@@ -125,12 +137,14 @@ export function parseCtrl(bytes: Uint8Array): CtrlMessage {
       }
       return { k: 'file-accept', transferId: m.transferId };
     }
-    case 'file-resume': {
+    case 'file-resume':
+    case 'file-ack': {
       if (!isUuidV4(m.transferId)) return fail('transferId: некорректно');
       if (typeof m.offset !== 'number' || !Number.isInteger(m.offset) || m.offset < 0) {
         return fail('offset: некорректно');
       }
-      return { k: 'file-resume', transferId: m.transferId, offset: m.offset };
+      if (m.offset > MAX_FILE_SIZE) return fail('offset: вне диапазона');
+      return { k: m.k, transferId: m.transferId, offset: m.offset };
     }
     case 'file-finish': {
       if (!isUuidV4(m.transferId)) return fail('transferId: некорректно');

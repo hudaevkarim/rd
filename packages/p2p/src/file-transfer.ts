@@ -34,6 +34,22 @@ import { sha256, toHex, concat } from '@rd/crypto';
 import { Emitter } from './emitter.js';
 import type { RoomMesh } from './room-mesh.js';
 
+/** Префикс идентификатора для журнала: полные UUID нечитаемы в логе. */
+function short(id: string): string {
+  return id.slice(0, 8);
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
 /** Источник файла: умеет отдать кусок, не читая файл целиком. */
 export interface TransferSource {
   readonly size: number;
@@ -80,7 +96,23 @@ export interface FileTransferOptions {
   resolveSource(transferId: string): Promise<{ offer: FileOffer; source: TransferSource } | null>;
   /** Пользователь разрешил/запретил. null — спросить в UI. */
   autoAccept?(offer: FileOffer, from: PeerId): Promise<boolean>;
+  /** Краткие события для интерфейса: показываются пользователю. */
   onLog?(message: string): void;
+  /**
+   * Подробный журнал передачи.
+   *
+   * Разделение с `onLog` неформальное: `onLog` идёт в UI, поэтому туда попадают
+   * только события, которые стоит показать человеку, а сюда — весь ход передачи:
+   * номера чанков, размер буфера, паузы, таймауты подтверждений. Именно эти
+   * строки нужны, чтобы понять, на каком чанке передача встала.
+   */
+  onTrace?(message: string): void;
+  /** Окно передачи в байтах. По умолчанию DEFAULT_WINDOW_BYTES. */
+  windowBytes?: number;
+  /** Таймаут ожидания места в буфере. По умолчанию CAPACITY_TIMEOUT_MS. */
+  capacityTimeoutMs?: number;
+  /** Таймаут ожидания ACK. По умолчанию ACK_TIMEOUT_MS. */
+  ackTimeoutMs?: number;
 }
 
 interface SendJob {
@@ -89,6 +121,18 @@ interface SendJob {
   peers: Set<PeerId>;
   sentTo: Set<PeerId>;
   cancelled: boolean;
+  /**
+   * Запрошенная докачка: смещение, с которого пир хочет продолжить.
+   *
+   * Насос на пару должен быть ровно один. Если бы запрос докачки начинал новый
+   * цикл отправки поверх идущего, два цикла отправляли бы чанки вперемешку, и
+   * получатель видел бы «перепрыгивание» смещений — то самое, из-за которого он
+   * и просит докачку. Получается петля: запрос → новый цикл → рассинхрон →
+   * запрос → … Поток один, а смещение меняет.
+   */
+  resumeAt: number | null;
+  /** Идёт ли сейчас отправка этой паре. */
+  pumping: boolean;
 }
 
 interface ReceiveJob {
@@ -106,6 +150,13 @@ export class FileTransferManager {
   readonly events = new Emitter<FileTransferEvents>();
   readonly #opts: FileTransferOptions;
   readonly #chunkSize: number;
+  readonly #windowBytes: number;
+  readonly #capacityTimeoutMs: number;
+  readonly #ackTimeoutMs: number;
+  /** Кто и сколько подтвердил: нужно, чтобы знать, можно ли двигать окно. */
+  readonly #acked = new Map<string, Map<PeerId, number>>();
+  /** Передачи, о которых уже сообщили об ошибке: не даём повторять сообщение. */
+  readonly #failed = new Set<string>();
   readonly #sending = new Map<string, SendJob>();
   readonly #receiving = new Map<string, ReceiveJob>();
   /** Пиры, уже подтвердившие получение. */
@@ -133,6 +184,19 @@ export class FileTransferManager {
   constructor(opts: FileTransferOptions) {
     this.#opts = opts;
     this.#chunkSize = opts.chunkSize ?? CHUNK_SIZE;
+    this.#windowBytes = Math.max(this.#chunkSize, opts.windowBytes ?? DEFAULT_WINDOW_BYTES);
+    this.#capacityTimeoutMs = opts.capacityTimeoutMs ?? CAPACITY_TIMEOUT_MS;
+    this.#ackTimeoutMs = opts.ackTimeoutMs ?? ACK_TIMEOUT_MS;
+  }
+
+  /** Подробный журнал: подробности хода передачи, не показывается в UI. */
+  #trace(message: string): void {
+    this.#opts.onTrace?.(message);
+  }
+
+  /** Сколько байт пир подтвердил как принятые. */
+  ackedBytes(transferId: string, peerId: PeerId): number {
+    return this.#acked.get(transferId)?.get(peerId) ?? 0;
   }
 
   get activeSends(): number {
@@ -198,7 +262,17 @@ export class FileTransferManager {
     const peers = new Set(this.#opts.mesh.readyPeers);
     if (peers.size === 0) throw new Error('нет готовых соединений для передачи файла');
 
-    this.#sending.set(transferId, { offer, source: params.source, peers, sentTo: new Set(), cancelled: false });
+    this.#failed.delete(transferId);
+    this.#acked.delete(transferId);
+    this.#sending.set(transferId, {
+      offer,
+      source: params.source,
+      peers,
+      sentTo: new Set(),
+      cancelled: false,
+      resumeAt: null,
+      pumping: false,
+    });
     this.#accepted.set(transferId, new Set());
 
     for (const peerId of peers) {
@@ -260,7 +334,21 @@ export class FileTransferManager {
         if (job === undefined) return;
         this.#accepted.get(msg.transferId)?.add(peerId);
         this.#clearOfferTimer(msg.transferId);
+        this.#trace(`докачка ${short(msg.transferId)} от ${short(peerId)} с ${msg.offset}`);
         void this.#pump(job, peerId, msg.offset).catch(() => {});
+        return;
+      }
+      case 'file-ack': {
+        // Кумулятивное подтверждение: сдвигает окно отправителя. Сообщение
+        // может прийти и для уже завершённой передачи (оно идёт по ctrl-каналу
+        // вместе со всем остальным), поэтому отсутствие задачи — не ошибка.
+        let byPeer = this.#acked.get(msg.transferId);
+        if (byPeer === undefined) {
+          byPeer = new Map();
+          this.#acked.set(msg.transferId, byPeer);
+        }
+        const prev = byPeer.get(peerId) ?? 0;
+        if (msg.offset > prev) byPeer.set(peerId, msg.offset);
         return;
       }
       case 'file-finish': {
@@ -288,45 +376,198 @@ export class FileTransferManager {
     }
   }
 
-  /** Отправляет чанки одному пиру, уважая backpressure. */
+  /**
+   * Отправляет чанки одному пиру.
+   *
+   * ─── Почему здесь окно, а не «отправил и жди» ───────────────────────────────
+   *
+   * Прежний вариант работал так: отправить чанк → дождаться, пока буфер канала
+   * опустеет полностью (`waitFileDrained`). На живом DataChannel это давало две
+   * беды, обе проявлялись только в реальной сети:
+   *
+   *   1. Ожидание `bufferedAmount === 0` не срабатывало никогда — событие
+   *      `bufferedamountlow` настроено на порог 256 КиБ, а очередь никогда не
+   *      доходила до него. Отправитель зависал намертво после первого чанка, у
+   *      которого буфер не успел опустеть. В тестах этого не видно: там
+   *      `bufferedAmount` всегда 0.
+   *   2. Даже если бы ожидание срабатывало, один чанк за раз — это 16 КиБ на
+   *      RTT, то есть ~200 КБ/с при 60 мс задержке. Книга читается веками.
+   *
+   * Теперь работает скользящее окно: шлём, пока
+   *   (a) в канале есть место (`hasFileCapacity`), и
+   *   (b) неподтверждённых данных меньше `windowBytes`.
+   *
+   * Условие (b) важно и для памяти: локальный буфер SCTP освобождается, когда
+   * байты ушли в сокет получателя, а не когда он их записал. Окно по ACK держит
+   * реальное число «повисших» чанков в узде получателя.
+   */
   async #pump(job: SendJob, peerId: PeerId, startOffset?: number): Promise<void> {
-    if (job.sentTo.has(peerId) && startOffset === undefined) return;
+    // На пару — ровно один цикл отправки. Запрос докачки от уже идущей передачи
+    // не должен плодить второй цикл: см. комментарий у SendJob.resumeAt.
+    if (job.pumping) {
+      if (startOffset !== undefined) job.resumeAt = startOffset;
+      return;
+    }
+    job.pumping = true;
     job.sentTo.add(peerId);
 
-    const transferIdRaw = uuidToBytes(job.offer.transferId);
+    const transferId = job.offer.transferId;
+    const transferIdRaw = uuidToBytes(transferId);
     const chunkSize = this.#chunkSize;
     let offset = Math.max(0, Math.min(startOffset ?? 0, job.offer.size));
+    // Нижняя граница окна: подтверждённое получателем смещение.
+    let acked = Math.max(offset, this.ackedBytes(transferId, peerId));
+    let chunkIndex = Math.floor(offset / chunkSize);
+    let lastTrace = 0;
+    let stalls = 0;
+
+    this.#trace(
+      `отправка ${short(transferId)} → ${short(peerId)}: с ${offset} из ${job.offer.size}, окно ${this.#windowBytes} Б`,
+    );
 
     try {
-      while (offset < job.offer.size && !job.cancelled) {
+      for (;;) {
+        // Пир попросил докачку с другого места: переносим начало, но цикл
+        // остаётся тем же — параллельных отправителей не появляется.
+        if (job.resumeAt !== null) {
+          const from = Math.max(0, Math.min(job.resumeAt, job.offer.size));
+          job.resumeAt = null;
+          if (from !== offset) {
+            this.#trace(`докачка ${short(transferId)} → ${short(peerId)}: перенос с ${offset} на ${from}`);
+            offset = from;
+            acked = Math.min(acked, from);
+            chunkIndex = Math.floor(offset / chunkSize);
+            lastTrace = 0;
+          }
+        }
+        if (offset >= job.offer.size) break;
+        if (job.cancelled) return;
+        // 1. Окно по подтверждениям: ждём, пока получатель запишет уже отправленное.
+        while (offset - acked >= this.#windowBytes && !job.cancelled) {
+          const buffer = this.#opts.mesh.fileBufferOf(peerId);
+          stalls++;
+          if (stalls === 1 || stalls % 10 === 0) {
+            this.#trace(
+              `ждём окно: не подтверждено ${offset - acked} Б из ${this.#windowBytes}, буфер ${buffer.buffered} Б, отправлено ${offset} из ${job.offer.size}`,
+            );
+          }
+          const progressed = await this.#waitForAck(transferId, peerId, () => acked, (v) => {
+            acked = v;
+          });
+          if (!progressed) {
+            this.#fail(
+              transferId,
+              `пир ${short(peerId)} не подтвердил приём за ${this.#ackTimeoutMs} мс (окно встало на ${offset} из ${job.offer.size})`,
+            );
+            return;
+          }
+        }
+        if (job.cancelled) return;
+
+        // 2. Место в буфере канала. Здесь и был главный источник зависания.
+        while (!this.#opts.mesh.hasFileCapacity(peerId) && !job.cancelled) {
+          const buffer = this.#opts.mesh.fileBufferOf(peerId);
+          stalls++;
+          if (stalls === 1 || stalls % 10 === 0) {
+            this.#trace(
+              `пауза буфера: ${short(peerId)} = ${buffer.buffered} Б (порог ${buffer.high}), отправлено ${offset} из ${job.offer.size}`,
+            );
+          }
+          const ok = await this.#opts.mesh.waitFileCapacity(
+            peerId,
+            this.#capacityTimeoutMs,
+            `чанк #${chunkIndex} (${offset} из ${job.offer.size} Б)`,
+          );
+          if (!ok) {
+            const again = this.#opts.mesh.fileBufferOf(peerId);
+            this.#fail(
+              transferId,
+              `буфер отправки ${short(peerId)} не опустел за ${this.#capacityTimeoutMs} мс (${again.buffered} Б при пороге ${again.high})`,
+            );
+            return;
+          }
+        }
+        if (job.cancelled) return;
+
+        // 3. Отправляем чанк.
         const end = Math.min(offset + chunkSize, job.offer.size);
         const data = await job.source.slice(offset, end);
         await this.#opts.mesh.sendFileChunk(peerId, transferIdRaw, offset, data);
         offset = end;
+
         this.events.emit('progress', {
-          transferId: job.offer.transferId,
+          transferId,
           peerId,
           done: offset,
           total: job.offer.size,
           direction: 'out',
         });
-        if (offset < job.offer.size) {
-          await this.#opts.mesh.waitFileDrained(peerId);
+
+        // 4. Журнал: по номеру чанка, но не чаще, чем раз в TRACE_MIN_INTERVAL_MS.
+        const now = Date.now();
+        if (chunkIndex % TRACE_EVERY_CHUNKS === 0 || now - lastTrace >= TRACE_MIN_INTERVAL_MS) {
+          lastTrace = now;
+          const buffer = this.#opts.mesh.fileBufferOf(peerId);
+          this.#trace(
+            `чанк #${chunkIndex} ${offset}/${job.offer.size} · буфер ${buffer.buffered}/${buffer.high} Б · в окне ${offset - acked} Б · пауз ${stalls}`,
+          );
         }
-      }
-      if (offset >= job.offer.size && !job.cancelled) {
-        this.#opts.mesh.sendCtrlTo(peerId, { k: 'file-finish', transferId: job.offer.transferId, root: job.offer.root });
-        this.events.emit('complete', { transferId: job.offer.transferId, offer: job.offer, direction: 'out' });
-        // Передача считается завершённой, когда все согласившиеся пиры получили файл.
-        const accepted = this.#accepted.get(job.offer.transferId);
-        if (accepted !== undefined && accepted.size >= job.peers.size) {
-          this.#sending.delete(job.offer.transferId);
-          this.#accepted.delete(job.offer.transferId);
-        }
+        chunkIndex++;
       }
     } catch (err) {
-      this.#fail(job.offer.transferId, `передача пиру ${peerId.slice(0, 8)} прервана: ${(err as Error).message}`);
+      job.pumping = false;
+      this.#fail(transferId, `передача пиру ${short(peerId)} прервана: ${errText(err)}`);
+      return;
     }
+
+    // Цикл завершён: снимаем флаг, чтобы запрос докачки после этого смог
+    // запустить новый цикл с нуля.
+    job.pumping = false;
+    if (job.resumeAt !== null || job.cancelled) return;
+    if (offset < job.offer.size) return;
+
+    this.#trace(`отправка ${short(transferId)} → ${short(peerId)} завершена: ${offset} Б, пауз ${stalls}`);
+    this.#opts.mesh.sendCtrlTo(peerId, { k: 'file-finish', transferId, root: job.offer.root });
+    this.events.emit('complete', { transferId, offer: job.offer, direction: 'out' });
+    // Передача считается завершённой, когда все согласившиеся пиры получили файл.
+    const accepted = this.#accepted.get(transferId);
+    if (accepted !== undefined && accepted.size >= job.peers.size) {
+      this.#sending.delete(transferId);
+      this.#accepted.delete(transferId);
+    }
+  }
+
+  /**
+   * Ждёт, пока получатель подтвердит данные, сдвигая окно.
+   *
+   * Опрос вместо события: ACK приходят через ctrl-канал, и на загруженном
+   * ctrl-канале они могут задержаться на сотни миллисекунд. Таймаут обязателен —
+   * иначе «молчащий» получатель держит передачу открытой вечно.
+   *
+   * @returns true — окно сдвинулось; false — таймаут или отмена.
+   */
+  async #waitForAck(
+    transferId: string,
+    peerId: PeerId,
+    read: () => number,
+    write: (value: number) => void,
+  ): Promise<boolean> {
+    const start = read();
+    const deadline = Date.now() + this.#ackTimeoutMs;
+    while (Date.now() < deadline) {
+      const current = this.ackedBytes(transferId, peerId);
+      if (current > start) {
+        write(current);
+        return true;
+      }
+      await sleep(ACK_POLL_MS);
+    }
+    const final = this.ackedBytes(transferId, peerId);
+    if (final > start) {
+      write(final);
+      return true;
+    }
+    return false;
   }
 
   // ─── Приём ───────────────────────────────────────────────────────────────────
@@ -410,11 +651,23 @@ export class FileTransferManager {
         direction: 'in',
       });
 
+      // Кумулятивное подтверждение. Отправляется каждый чанк: ctrl-канал
+      // отдельный и не блокируется файловым, а без ACK окно отправителя не
+      // сдвинется. Сообщение крошечное (около 60 байт), на скорости передачи
+      // это доли процента трафика.
+      this.#opts.mesh.sendFileAck(job.from, chunk.transferId, job.expectedNext);
+
+      if (chunk.offset % (TRACE_EVERY_CHUNKS * this.#chunkSize) === 0) {
+        this.#trace(
+          `приём ${short(chunk.transferId)} ← ${short(chunk.peerId)}: ${job.expectedNext}/${job.offer.size} Б`,
+        );
+      }
+
       if (job.expectedNext >= job.offer.size) {
         await this.#finishReceive(job);
       }
     } catch (err) {
-      this.#fail(chunk.transferId, `запись не удалась: ${(err as Error).message}`);
+      this.#fail(chunk.transferId, `запись не удалась: ${errText(err)}`);
     }
   }
 
@@ -433,6 +686,12 @@ export class FileTransferManager {
   }
 
   #fail(transferId: string, message: string): void {
+    // Повторное сообщение об одной и той же передаче в UI не приносит пользы:
+    // список передач всё равно один. При обрыве сети несколько ожиданий могут
+    // сработать почти одновременно, и без этой проверки пользователь получил бы
+    // десяток одинаковых уведомлений.
+    if (this.#failed.has(transferId)) return;
+    this.#failed.add(transferId);
     this.#clearOfferTimer(transferId);
     this.#sending.delete(transferId);
     this.#accepted.delete(transferId);
@@ -457,3 +716,43 @@ export async function computeRoot(source: TransferSource, chunkSize = CHUNK_SIZE
 export { uuidToBytes, uuidFromBytes } from '@rd/protocol';
 
 export { CHUNK_SIZE };
+
+/**
+ * Окно передачи в байтах.
+ *
+ * 256 КиБ = 16 чанков по 16 КиБ. Совпадает с FILE_HIGH_WATER_MARK намеренно: окно
+ * должно быть не больше очереди канала, иначе смысл backpressure теряется —
+ * отправитель забивает канал, но получатель всё равно не успевает забирать.
+ *
+ * Ниже 128 КиБ окно становится слишком узким для мобильных сетей (RTT 150 мс даёт
+ * ~1,7 МБ/с), выше 512 КиБ — очередь начинает давить на память получателя.
+ */
+export const DEFAULT_WINDOW_BYTES = 256 * 1024;
+
+/**
+ * Таймаут ожидания свободного места в буфере отправки.
+ *
+ * Заведомо больше нормального времени: буфер опустошается за единицы
+ * миллисекунд на нормальном канале. Превышение означает, что канал мёртв
+ * (обрыв без закрытия — типично для мобильной сети), и ждать дальше бессмысленно.
+ */
+export const CAPACITY_TIMEOUT_MS = 20_000;
+
+/**
+ * Таймаут ожидания подтверждения приёма.
+ *
+ * Отправитель шлёт чанки и ждёт, пока получатель подтвердит запись. Если за это
+ * время ACK не пришёл, принимающая сторона зависла (тяжёлый диск, вкладка в фоне,
+ * разрыв сети) — и передачу надо перезапустить с подтверждённого места, а не
+ * молча стоять.
+ */
+export const ACK_TIMEOUT_MS = 20_000;
+
+/** Как часто проверять, не пришёл ли ACK, пока ждём окно. */
+const ACK_POLL_MS = 50;
+
+/** Как часто писать в журнал ход передачи. По чанку — слишком шумно. */
+const TRACE_EVERY_CHUNKS = 8;
+
+/** Не чаще этого журнал отправки, даже если чанки идут часто. */
+const TRACE_MIN_INTERVAL_MS = 400;

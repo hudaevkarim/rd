@@ -33,6 +33,7 @@ import {
   parseHello,
   readFrame,
   uuidFromBytes,
+  uuidToBytes,
   type CtrlMessage,
   type IceCandidatePayload,
   type PeerDescriptor,
@@ -53,6 +54,21 @@ import type { RtcConfig, RtcDataChannel, RtcFactory, RtcPeerConnection, SessionD
 
 /** Сколько зашифрованных кадров копим, пока идёт рукопожатие. */
 const MAX_PENDING_CTRL_FRAMES = 64;
+
+/**
+ * Границы очереди файлового канала.
+ *
+ * High-water — сколько неподтверждённых байт допустимо держать в канале: 256 КиБ
+ * это 16 чанков по 16 КиБ, то есть ровно столько, сколько влезает в окно
+ * передачи без риска переполнить получателя.
+ *
+ * Low-water намеренно вдвое меньше. Между high и low событие `bufferedamountlow`
+ * НЕ срабатывает (оно срабатывает только при пересечении самого порога), а
+ * ждать следующего чанка приходится именно в этой зоне — следовательно, порог
+ * обязан совпадать с low-water, иначе отправитель встанет здесь навсегда.
+ */
+export const FILE_HIGH_WATER_MARK = 256 * 1024;
+export const FILE_LOW_WATER_MARK = 128 * 1024;
 
 export const CTRL_CHANNEL = 'rd-ctrl';
 export const FILE_CHANNEL = 'rd-file';
@@ -87,6 +103,7 @@ export interface PeerLinkOptions {
   rtc: RtcFactory;
   rtcConfig: RtcConfig;
   signal: (out: SignalOut) => void;
+  onTrace?(message: string): void;
 }
 
 export class PeerLink {
@@ -100,8 +117,8 @@ export class PeerLink {
   readonly #pc: RtcPeerConnection;
   readonly #handshake: PairHandshake;
   readonly #signal: (out: SignalOut) => void;
-  readonly #ctrlOut = new ChannelSender(CTRL_CHANNEL);
-  readonly #fileOut = new ChannelSender(FILE_CHANNEL);
+  readonly #ctrlOut: ChannelSender;
+  readonly #fileOut: ChannelSender;
 
   #state: LinkState = 'new';
   #ctrlIn: RtcDataChannel | null = null;
@@ -140,6 +157,15 @@ export class PeerLink {
       roomId: opts.roomId,
       self: opts.self,
       passKey: opts.passKey,
+    });
+
+    this.#ctrlOut = new ChannelSender(CTRL_CHANNEL, { onTrace: opts.onTrace });
+    // Файловый канал — самый чувствительный к backpressure, поэтому пороги
+    // задаются явно, а не «как получится».
+    this.#fileOut = new ChannelSender(FILE_CHANNEL, {
+      highWaterMark: FILE_HIGH_WATER_MARK,
+      lowWaterMark: FILE_LOW_WATER_MARK,
+      onTrace: opts.onTrace,
     });
 
     this.#pc = opts.rtc(opts.rtcConfig);
@@ -495,6 +521,23 @@ export class PeerLink {
     void this.#sealAndSend(this.#aeadCtrl as AeadChannel, this.#ctrlOut, FrameType.Json, encodeCtrl(msg));
   }
 
+  /**
+   * Подтверждение приёма чанков. Отдельный метод, а не поле в `sendCtrlJson`,
+   * потому что именно этот тип сообщений отправляется пачками: сливать его с
+   * чатом нельзя — на забитом ctrl-канале подтверждения встают в очередь за
+   * сообщениями и передача файла зависает, хотя файл-канал свободен.
+   */
+  sendFileAck(transferIdRaw: Uint8Array, offset: number): void {
+    const aead = this.#aeadCtrl;
+    if (aead === null || this.#state !== 'ready') return;
+    void this.#sealAndSend(
+      aead,
+      this.#ctrlOut,
+      FrameType.Json,
+      encodeCtrl({ k: 'file-ack', transferId: uuidFromBytes(transferIdRaw), offset }),
+    );
+  }
+
   sendYjsSync(data: Uint8Array): void {
     this.#requireReady();
     void this.#sealAndSend(this.#aeadCtrl as AeadChannel, this.#ctrlOut, FrameType.YjsSync, data);
@@ -521,13 +564,21 @@ export class PeerLink {
     this.#fileOut.send(frame);
   }
 
-  /** Ждёт, пока очередь отправки файлов опустеет — основа backpressure. */
-  waitFileDrained(): Promise<void> {
-    return this.#fileOut.waitDrained();
+  /** Есть ли место в очереди файлового канала прямо сейчас. */
+  get hasFileCapacity(): boolean {
+    return this.#fileOut.hasCapacity;
   }
 
-  get fileBuffer(): { buffered: number; queued: number } {
-    return { buffered: this.#fileOut.bufferedAmount, queued: this.#fileOut.queuedCount };
+  /**
+   * Ждёт места в очереди файлового канала. Основа backpressure передачи файла.
+   * @returns false по таймауту или при закрытии — вызывающий обязан это учесть.
+   */
+  waitFileCapacity(timeoutMs: number, reason = ''): Promise<boolean> {
+    return this.#fileOut.waitForCapacity(timeoutMs, reason);
+  }
+
+  get fileBuffer(): { buffered: number; queued: number; high: number; low: number; waits: number } {
+    return this.#fileOut.stats;
   }
 
   async #sealAndSend(aead: AeadChannel, out: ChannelSender, type: number, body: Uint8Array): Promise<void> {

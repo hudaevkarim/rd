@@ -258,6 +258,27 @@ function LibraryPanel(props: {
   const state = useSession(props.session);
   const [busy, setBusy] = useState(false);
   const books = state?.books ?? [];
+  // Наличие файла берётся ИЗ СОСТОЯНИЯ, а не вызовом hasLocalFile: тот читает
+  // внутренний Set, который снаружи сессии не виден, и панель не перерисовывалась
+  // бы в момент докачки.
+  const localFiles = useMemo(() => new Set(state?.localFiles ?? []), [state?.localFiles]);
+  const [sharing, setSharing] = useState<string | null>(null);
+
+  const share = useCallback(
+    async (bookId: string) => {
+      setSharing(bookId);
+      try {
+        await props.session.shareBook(bookId);
+      } catch (err) {
+        // Здесь чаще всего «нет готовых соединений»: сигнал ещё идёт, либо
+        // собеседник не появился. Сообщение пользователю полезнее, чем тишина.
+        window.alert(`Передать не удалось: ${(err as Error).message}`);
+      } finally {
+        setSharing(null);
+      }
+    },
+    [props],
+  );
 
   const onFile = async (file: File | null): Promise<void> => {
     if (file === null) return;
@@ -295,7 +316,9 @@ function LibraryPanel(props: {
 
       <ul className="space-y-1.5">
         {books.map((b) => {
-          const local = props.session.hasLocalFile(b.id);
+          const local = localFiles.has(b.id);
+          const isAudio = b.format === 'audio';
+          const minutes = b.durationSec !== null && b.durationSec > 0 ? `${Math.round(b.durationSec / 60)} мин · ` : '';
           return (
             <li key={b.id}>
               <button
@@ -305,9 +328,14 @@ function LibraryPanel(props: {
                   props.activeBook === b.id ? 'border-accent-600 bg-ink-800' : 'border-ink-800 hover:border-ink-600'
                 }`}
               >
-                <span className="block truncate text-ink-100">{b.title}</span>
+                <span className="block truncate text-ink-100">
+                  {isAudio && <span className="mr-1 text-ink-500">♪</span>}
+                  {b.title}
+                </span>
                 <span className="block truncate text-xs text-ink-500">
-                  {b.author} · {(b.size / 1024).toFixed(0)} КБ
+                  {b.author !== '' && `${b.author} · `}
+                  {minutes}
+                  {(b.size / 1024 / 1024).toFixed(1)} МБ
                 </span>
               </button>
               <div className="mt-1 flex gap-1">
@@ -319,10 +347,11 @@ function LibraryPanel(props: {
                 {local && (
                   <button
                     type="button"
-                    onClick={() => props.onShare(b.id)}
-                    className="rounded bg-ink-800 px-1.5 py-0.5 text-[10px] text-ink-300 hover:bg-ink-700"
+                    onClick={() => void share(b.id)}
+                    disabled={sharing === b.id}
+                    className="rounded bg-ink-800 px-1.5 py-0.5 text-[10px] text-ink-300 hover:bg-ink-700 disabled:opacity-50"
                   >
-                    передать участникам
+                    {sharing === b.id ? 'передаём…' : 'передать участникам'}
                   </button>
                 )}
               </div>

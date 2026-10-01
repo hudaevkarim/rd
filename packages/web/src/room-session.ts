@@ -40,6 +40,7 @@ import { blobSource, BookIndex, createLibraryStore, parseEpub, RoomDoc, type Boo
 import { newId, type PeerDescriptor, type RoomId } from '@rd/protocol';
 import { AudioPlayer } from './audio-player.js';
 import type { RemotePosition } from './audio-core.js';
+import { LocalFiles, transferFileName } from './local-files.js';
 
 
 
@@ -117,6 +118,15 @@ export interface SessionState {
   others: Record<string, PeerReading>;
   /** Следует ли за чужой позицией воспроизведения. По умолчанию false. */
   audioFollow: boolean;
+  /**
+   * Идентификаторы книг, чей файл лежит на этом устройстве.
+   *
+   * В состоянии, а не в отдельном геттере сессии: список книг перерисовывается
+   * по подписке, и изменение наличия файла должно попадать в тот же снимок.
+   * Иначе после докачки кнопка «передать участникам» появлялась бы только
+   * после перезагрузки страницы.
+   */
+  localFiles: string[];
 }
 
 /** Позиция воспроизведения в awareness. Всё здесь приходит из сети. */
@@ -164,6 +174,7 @@ export class RoomSession {
     safety: {},
     others: {},
     audioFollow: false,
+    localFiles: [],
   };
 
   readonly #store = createLibraryStore();
@@ -174,6 +185,14 @@ export class RoomSession {
   readonly #transfersByKey = new Map<string, TransferView>();
   /** Разобранные книги: разбор EPUB дорогой, поэтому кэшируем. */
   readonly #parsed = new Map<string, ParsedEpub>();
+  /**
+   * Книги, чей файл реально лежит в IndexedDB на этом устройстве.
+   *
+   * Отдельно от `#parsed`, потому что разбор есть только у EPUB, а аудиокнигу
+   * нечем разбирать. Проверять наличие файла по кэшу разбора было ошибкой:
+   * аудиокнига всегда считалась «не полученной».
+   */
+  readonly #localFiles = new LocalFiles();
   readonly #indexes = new Map<string, BookIndex>();
   readonly #audioDuration: Record<string, number> = {};
   readonly #options: SessionOptions;
@@ -225,6 +244,9 @@ export class RoomSession {
     // явного согласия — худшее, что может сделать плеер в чужой комнате.
     const follow = await session.#store.getSetting<boolean>(audioFollowKey).catch(() => undefined);
     session.#patch({ audioFollow: follow === true });
+    // Каталог комнаты уже загружен: сверяем его с тем, что лежит на диске,
+    // иначе после перезагрузки все книги выглядят «не полученными».
+    await session.refreshLocalFiles().catch(() => []);
 
     const descriptor: PeerDescriptor = {
       id: newId(),
@@ -390,6 +412,9 @@ export class RoomSession {
         view.state = 'done';
         view.done = view.total;
       }
+      // Файл докачался и лежит в IndexedDB — отмечаем сразу. Иначе кнопка
+      // «передать участникам» оставалась бы скрытой до следующей перезагрузки.
+      this.#markLocal(offer.bookId);
       this.#patch({ transfers: [...this.#transfersByKey.values()] });
       if (direction === 'in') this.#scheduleSave();
       if (direction === 'out' && offer.root !== '') this.#doc.patchBook(offer.bookId, { root: offer.root });
@@ -493,6 +518,7 @@ export class RoomSession {
     });
 
     this.#parsed.set(id, parsed);
+    this.#markLocal(id);
     this.#indexes.set(id, new BookIndex(parsed));
     this.#doc.addBook({
       id,
@@ -538,6 +564,7 @@ export class RoomSession {
       lastOpenedAt: null,
     });
 
+    this.#markLocal(id);
     this.#doc.addBook({
       id,
       title: stripAudioExtension(file.name),
@@ -587,7 +614,9 @@ export class RoomSession {
 
     const offer = await this.#parts.transfers.share({
       bookId,
-      name: `${book.title}.epub`,
+      // Расширение берётся из формата, а не подставляется всегда `.epub`:
+      // иначе получатель сохранял бы mp3 как «Книга.epub».
+      name: transferFileName(book.title, book.format, stored.mime),
       mime: stored.mime,
       source: blobSource(stored.blob) as TransferSource,
     });
@@ -606,12 +635,52 @@ export class RoomSession {
     if (stored?.blob == null) return null;
     const parsed = parseEpub(new Uint8Array(await stored.blob.arrayBuffer()));
     this.#parsed.set(bookId, parsed);
+    this.#markLocal(bookId);
     this.#indexes.set(bookId, new BookIndex(parsed));
     return parsed;
   }
 
+  /**
+   * Книги, у которых файл уже на этом устройстве.
+   *
+   * Нужна при входе в комнату: каталог приезжает по CRDT, а файлы лежат в
+   * IndexedDB отдельно. Без этой сверки интерфейс после перезагрузки показывал
+   * «получите от участника» даже для книг, которые лежат на диске.
+   */
+  async refreshLocalFiles(): Promise<string[]> {
+    const catalog = this.#doc.listBooks().map((b) => b.id);
+    const changed = await this.#localFiles.reconcile(async (bookId) => {
+      const stored = await this.#store.getBook(this.roomId, bookId).catch(() => undefined);
+      return stored?.blob != null;
+    }, catalog);
+    if (changed) this.#patch({ localFiles: [...this.#localFiles.ids] });
+    return this.#localFiles.ids;
+  }
+
+  /**
+   * Есть ли файл книги на этом устройстве.
+   *
+   * Проверяется по факту сохранения в IndexedDB, а НЕ по наличию разобранной
+   * книги в `#parsed`. Разбор есть только у EPUB: аудиокнига разбирать нечем,
+   * её файл лежит в хранилище как есть. Когда проверка шла по `#parsed`,
+   * у любой аудиокниги «файла не было», интерфейс прятал кнопку «передать
+   * участникам» и показывал «получите от участника» — то есть отправить
+   * было нечем.
+   */
   hasLocalFile(bookId: string): boolean {
-    return this.#parsed.has(bookId);
+    return this.#localFiles.has(bookId);
+  }
+
+  /**
+   * Отмечает книгу как лежащую на диске и обновляет состояние.
+   *
+   * Снимок `localFiles` пересоздаётся при каждом изменении: `useSyncExternalStore`
+   * сравнивает по ссылке, и переиспользование массива означало бы, что панель
+   * книг не перерисуется — то есть исходный баг вернётся с другой стороны.
+   */
+  #markLocal(bookId: string): void {
+    if (!this.#localFiles.add(bookId)) return;
+    this.#patch({ localFiles: [...this.#localFiles.ids] });
   }
 
   bookIndex(bookId: string): BookIndex | null {
@@ -671,6 +740,7 @@ export class RoomSession {
       blob: stored.blob,
       mime: stored.mime === '' ? entry.mime : stored.mime,
     });
+    this.#markLocal(bookId);
     return true;
   }
 

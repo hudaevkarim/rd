@@ -267,9 +267,7 @@ class ChunkedBlobSink implements TransferSink {
     this.#done = true;
 
     const stored = await this.#loadChunks();
-    // Blob из Blob'ов: IndexedDB не копирует байты целиком, поэтому пиковая
-    // память остаётся размером одного куска, а не размером книги.
-    const blob = new Blob(stored.map((c) => c.data));
+    const blob = assembleBlob(stored.map((c) => c.data), this.meta.mime);
 
     await this.db.books.put({
       id: this.meta.bookId,
@@ -307,6 +305,23 @@ class ChunkedBlobSink implements TransferSink {
       .toArray()
       .then((rows) => rows.sort((a, b) => a.part - b.part));
   }
+}
+
+/**
+ * Собирает принятые куски в один Blob.
+ *
+ * Вынесено отдельной функцией не для красоты, а потому что здесь терялся тип
+ * файла, и потеря была молчаливой. Blob, собранный из кусков, наследует ПУСТОЙ
+ * тип. Браузер для `<audio>` без распознаваемого type просто не начинает
+ * воспроизведение: файл лежит на диске, звука нет, в консоли чисто. Для EPUB
+ * это безразлично (его читает наш парсер, который тип не смотрит), а для
+ * аудиокниги — фатально.
+ *
+ * Тип берётся из записи книги, а не из кусков: куски сохранялись без него.
+ */
+export function assembleBlob(chunks: Blob[], mime: string): Blob {
+  const type = mime.trim();
+  return new Blob(chunks, type === '' ? undefined : { type });
 }
 
 /** Имя таблицы `books` для транзакций Dexie. */

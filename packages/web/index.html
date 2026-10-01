@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      Политика безопасности подчёркнуто строгая и без исключений:
+      - connect-src только наш signaling (переменная окружения VITE_SIGNALING_URL);
+      - connect-src 'self' НЕ включён для WebRTC — P2P-соединения идут напрямую
+        к адресам, полученным через ICE, и не проходят через браузерный прокси;
+      - шрифты и стили только свои, никаких внешних CDN.
+    -->
+    <meta name="referrer" content="no-referrer" />
+    <title>rd — чтение вместе</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>Для работы приложения нужен JavaScript: вся логика выполняется на вашем устройстве.</noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

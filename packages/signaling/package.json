@@ -1,0 +1,23 @@
+{
+  "name": "@rd/signaling",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Stateless signaling-сервер: только SDP/ICE и шифротекст, без хранения данных комнат",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node20 --packages=external --outfile=dist/main.js",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "@fastify/helmet": "^12.0.1",
+    "@fastify/websocket": "^11.0.1",
+    "@rd/protocol": "*",
+    "fastify": "^5.2.0",
+    "ws": "^8.18.0"
+  }
+}

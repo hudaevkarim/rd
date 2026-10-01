@@ -1,0 +1,125 @@
+@import 'tailwindcss';
+
+/*
+ * Тема подобрана под чтение: тёплый тёмный фон, высокий контраст текста,
+ * крупная базовая кегль. Цвета заданы как CSS-переменные, чтобы читатель мог
+ * переопределить их без правки компонентов.
+ */
+@theme {
+  --color-ink-50: #f7f5f2;
+  --color-ink-100: #e8e3dc;
+  --color-ink-200: #cfc7bc;
+  --color-ink-400: #8d8579;
+  --color-ink-600: #5a544c;
+  --color-ink-800: #2a2724;
+  --color-ink-900: #1a1816;
+  --color-ink-950: #121110;
+  --color-accent-400: #7aa2f7;
+  --color-accent-600: #3b6fd4;
+  --color-warn-500: #d98324;
+  --color-danger-500: #d9534f;
+  --font-serif: 'Iowan Old Style', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink-950);
+  color: var(--color-ink-100);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Книга: serif, увеличенный межстрочный, комфортная колонка. */
+.rd-prose {
+  font-family: var(--font-serif);
+  font-size: 1.125rem;
+  line-height: 1.75;
+  color: var(--color-ink-50);
+  max-width: 40rem;
+}
+.rd-prose p {
+  margin: 0 0 1.1em;
+  text-align: justify;
+  hyphens: auto;
+}
+.rd-prose h1,
+.rd-prose h2,
+.rd-prose h3 {
+  line-height: 1.25;
+  margin: 1.8em 0 0.7em;
+  font-weight: 600;
+}
+.rd-prose h1 {
+  font-size: 1.6em;
+}
+.rd-prose h2 {
+  font-size: 1.3em;
+}
+.rd-prose h3 {
+  font-size: 1.12em;
+}
+.rd-prose blockquote {
+  margin: 1.2em 0;
+  padding-left: 1em;
+  border-left: 2px solid var(--color-ink-600);
+  color: var(--color-ink-200);
+  font-style: italic;
+}
+.rd-prose li {
+  margin-bottom: 0.4em;
+}
+.rd-prose a {
+  color: var(--color-accent-400);
+  text-underline-offset: 2px;
+}
+.rd-prose hr {
+  border: 0;
+  border-top: 1px solid var(--color-ink-600);
+  margin: 2.5em auto;
+  width: 40%;
+}
+.rd-cell {
+  display: inline-block;
+  margin-right: 1em;
+}
+
+/* Подсветка абзаца, в котором стоит курсор: помогает не потерять место. */
+.rd-block-active {
+  background: color-mix(in srgb, var(--color-accent-600) 12%, transparent);
+  border-radius: 2px;
+  box-shadow: 0 0 0 6px color-mix(in srgb, var(--color-accent-600) 12%, transparent);
+}
+
+/* Выделение текста для будущего комментария. */
+.rd-pending-selection {
+  background: color-mix(in srgb, var(--color-warn-500) 35%, transparent);
+  border-radius: 2px;
+}
+
+/* Маска спойлера: текст не показываем, но место в потоке сохраняем. */
+.rd-spoiler-mask {
+  filter: blur(5px);
+  user-select: none;
+  cursor: pointer;
+  transition: filter 120ms ease;
+}
+.rd-spoiler-mask:hover {
+  filter: blur(2px);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-accent-600) 45%, transparent);
+}
+
+*:focus-visible {
+  outline: 2px solid var(--color-accent-400);
+  outline-offset: 2px;
+}

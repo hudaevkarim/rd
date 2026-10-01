@@ -1,0 +1,17 @@
+{
+  "name": "@rd/p2p",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "P2P-слой: WebRTC mesh, E2EE-каналы, Yjs-провайдер, передача файлов чанками",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@rd/crypto": "*",
+    "@rd/protocol": "*",
+    "lib0": "^0.2.99",
+    "y-protocols": "^1.0.6",
+    "yjs": "^13.6.20"
+  }
+}

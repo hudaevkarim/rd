@@ -1,0 +1,41 @@
+{
+  "name": "rd",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Децентрализованное P2P-приложение для совместного чтения книг и аудиокниг в приватных комнатах",
+  "license": "AGPL-3.0-or-later",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "workspaces": [
+    "packages/protocol",
+    "packages/crypto",
+    "packages/signaling",
+    "packages/p2p",
+    "packages/library",
+    "packages/web"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "dev": "npm run dev --workspace @rd/web",
+    "dev:server": "npm run dev --workspace @rd/signaling",
+    "build:server": "npm run build --workspace @rd/signaling",
+    "build:web": "npm run build --workspace @rd/web",
+    "build": "npm run build:server && npm run build:web",
+    "start:server": "npm run start --workspace @rd/signaling"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "@vitest/coverage-v8": "^3.2.0",
+    "esbuild": "^0.25.0",
+    "jsdom": "^26.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.5"
+  }
+}

@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.local
+.DS_Store
+packages/*/dist/
+.vite/
+
+# Артефакты упаковки и редакторов
+*.zip
+*.tsbuildinfo
+.idea/
+.vscode/

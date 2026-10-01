@@ -33,11 +33,24 @@ import {
   RoomMesh,
   WebSocketSignalTransport,
   YRoomProvider,
+  type RtcFactory,
   type RoomPeerInfo,
+  type SignalTransport,
   type TransferSource,
 } from '@rd/p2p';
-import { blobSource, BookIndex, createLibraryStore, parseEpub, RoomDoc, type BookEntry, type CommentAnchor, type CommentSnapshot, type ParsedEpub } from '@rd/library';
-import { newId, type PeerDescriptor, type RoomId } from '@rd/protocol';
+import {
+  blobSource,
+  BookIndex,
+  createLibraryStore,
+  parseEpub,
+  RoomDoc,
+  type BookEntry,
+  type CommentAnchor,
+  type CommentSnapshot,
+  type ParsedEpub,
+  type StoredBook,
+} from '@rd/library';
+import { newId, PBKDF2_ITERATIONS, type PeerDescriptor, type RoomId } from '@rd/protocol';
 import { AudioPlayer } from './audio-player.js';
 import type { RemotePosition } from './audio-core.js';
 import { LocalFiles, transferFileName } from './local-files.js';
@@ -141,6 +154,23 @@ export interface RemoteAudioState {
 /** Ключ настройки в IndexedDB: персональный, не общий для комнаты. */
 const audioFollowKey = 'audio-follow';
 
+/**
+ * Подменяемые части окружения.
+ *
+ * Нужны не для красоты: WebRTC в Node не работает физически, поэтому сквозной
+ * тест передачи файла через web-слой иначе собрать нельзя. Подменяются ровно
+ * те вещи, которые в Node не существуют: хранилище, сигналинг и сеть.
+ */
+export interface SessionDeps {
+  store: ReturnType<typeof createLibraryStore>;
+  /** Фабрика транспорта signaling. По умолчанию WebSocket. */
+  transport?: (descriptor: PeerDescriptor) => SignalTransport;
+  /** Фабрика RTCPeerConnection. */
+  rtc?: RtcFactory;
+  /** Итераций PBKDF2: в тестах 1000 вместо 600 тысяч. */
+  kdfIterations?: number;
+}
+
 export interface SessionOptions {
   roomId: RoomId;
   passphrase: string;
@@ -156,7 +186,7 @@ const PRESENCE_THROTTLE_MS = 400;
 interface Parts {
   identity: PeerIdentity;
   passKey: PassKey;
-  transport: WebSocketSignalTransport;
+  transport: SignalTransport;
   mesh: RoomMesh;
   provider: YRoomProvider;
   transfers: FileTransferManager;
@@ -177,7 +207,13 @@ export class RoomSession {
     localFiles: [],
   };
 
-  readonly #store = createLibraryStore();
+  /** Заменяемое окружение. Тесты подставляют своё: см. SessionDeps. */
+#deps: SessionDeps = { store: createLibraryStore() };
+
+  get #store(): ReturnType<typeof createLibraryStore> {
+    return this.#deps.store;
+  }
+
   readonly #doc = new RoomDoc();
   /** Плеер создаётся лениво: в комнате без аудиокниг он не нужен. */
   #audio: AudioPlayer | null = null;
@@ -225,14 +261,23 @@ export class RoomSession {
    * итераций занимает треть секунды даже на быстром ноутбуке, а на старом
    планшете — секунду.
    */
-  static async create(options: SessionOptions, onChange: (state: SessionState) => void): Promise<RoomSession> {
+  static async create(
+    options: SessionOptions,
+    onChange: (state: SessionState) => void,
+    deps?: Partial<SessionDeps>,
+  ): Promise<RoomSession> {
     const session = new RoomSession(options);
+    if (deps !== undefined) session.#deps = { ...session.#deps, ...deps };
     session.#listeners.add(() => onChange(session.state));
     session.#patch({ status: 'deriving' });
 
     await assertCryptoSupport();
     const identity = await createPeerIdentity();
-    const passKey = await derivePassKey(options.passphrase, options.roomId);
+    const passKey = await derivePassKey(
+      options.passphrase,
+      options.roomId,
+      session.#deps.kdfIterations ?? PBKDF2_ITERATIONS,
+    );
 
     // Офлайн-правки из IndexedDB применяем ДО подключения: тогда первая же
     // синхронизация с соседями увидит полное состояние.
@@ -256,19 +301,21 @@ export class RoomSession {
       agreeKey: toHex(identity.agreePubRaw),
     };
 
-    const transport = new WebSocketSignalTransport({
-      url: options.signalingUrl,
-      room: options.roomId,
-      peer: descriptor,
-      newPeerId: () => newId(),
-    });
+    const transport =
+      session.#deps.transport?.(descriptor) ??
+      new WebSocketSignalTransport({
+        url: options.signalingUrl,
+        room: options.roomId,
+        peer: descriptor,
+        newPeerId: () => newId(),
+      });
 
     const mesh = new RoomMesh({
       roomId: options.roomId,
       passKey,
       self: identity,
       transport,
-      rtc: defaultRtcFactory,
+      rtc: session.#deps.rtc ?? defaultRtcFactory,
       // Диагностика P2P-слоя: паузы передачи из-за backpressure, таймауты
       // подтверждений, состояние рукопожатия.
       onTrace: (message) => {
@@ -281,6 +328,15 @@ export class RoomSession {
       mesh,
       createSink: async (offer) => {
         const book = session.#doc.bookEntry(offer.bookId);
+        // Защита от чужих файлов: без записи в каталоге комнаты книга не
+        // принимается. Раньше проверка жила только в обработчике события
+        // 'incoming' и влияла на ВИД в интерфейсе — сам приёмник при этом
+        // создавался, и файл спокойно ложился на диск. Комментарий обещал
+        // защиту, которой не было.
+        if (book === undefined) {
+          session.#warn(`файл отклонён: «${offer.name}» нет в каталоге комнаты`);
+          return null;
+        }
         return session.#store.createSink({
           roomId: options.roomId,
           transferId: offer.transferId,
@@ -296,12 +352,14 @@ export class RoomSession {
       },
       findPartial: (offer) => session.#store.partialBytes(options.roomId, offer.transferId),
       resolveSource: async (transferId) => null,
-      onLog: (message) => session.#warn(message),
       // Подробный журнал — только в консоль: пользователю сотни строк «чанк #47,
       // буфер 120 КБ» не нужны, а при разборе зависшей передачи без них не обойтись.
       onTrace: (message) => {
         console.debug('[rd/передача]', message);
       },
+      // Причины отказа видны пользователю: «файла нет в каталоге» иначе
+      // выглядит как зависшая передача без объяснений.
+      onLog: (message) => session.#warn(message),
     });
 
     session.#parts = { identity, passKey, transport, mesh, provider, transfers };
@@ -326,6 +384,17 @@ export class RoomSession {
 
   get mesh(): RoomMesh {
     return this.#parts.mesh;
+  }
+
+  /**
+   * Менеджер передач.
+   *
+   * Нужен сквозным тестам: они проверяют приём файла, которого нет в каталоге,
+   * а `shareBook` такой файл отправлять не даст (и правильно — получатель его
+   * всё равно отклонит).
+   */
+  get transfers(): FileTransferManager {
+    return this.#parts.transfers;
   }
 
   get selfId(): string {
@@ -669,6 +738,17 @@ export class RoomSession {
    */
   hasLocalFile(bookId: string): boolean {
     return this.#localFiles.has(bookId);
+  }
+
+  /**
+   * Читает локально сохранённую книгу.
+   *
+   * Нужна UI и тестам: без неё нечем проверить, что файл доехал целиком, и
+   * единственным признаком было бы «кнопка появилась».
+   */
+  async readLocalBook(bookId: string): Promise<StoredBook | null> {
+    const stored = await this.#store.getBook(this.roomId, bookId).catch(() => undefined);
+    return stored ?? null;
   }
 
   /**

@@ -49,7 +49,7 @@ import {
 } from '@rd/crypto';
 import { toHex } from '@rd/crypto';
 import { Emitter } from './emitter.js';
-import { ChannelSender } from './channel-sender.js';
+import { ChannelSender, type CapacityWait } from './channel-sender.js';
 import type { RtcConfig, RtcDataChannel, RtcFactory, RtcPeerConnection, SessionDescription } from './transport.js';
 
 /** Сколько зашифрованных кадров копим, пока идёт рукопожатие. */
@@ -420,6 +420,28 @@ export class PeerLink {
     }
   }
 
+  /**
+   * Разматывает управляющее сообщение.
+   *
+   * Разбор вынесен из #dispatchCtrl намеренно. `parseCtrl` бросает CtrlError на
+   * любом несоответствии полей, а вызывающий код был в `try` соседнего метода —
+   * и исключение уходило в необработанный промис, рвая соединение вместо того,
+   * чтобы отбросить одно сообщение.
+   *
+   * Это не теория: одно длинное имя файла (204 символа при лимите 200) убивало
+   * весь канал управления. Каталог книги приезжал нормально — по нему и было
+   * видно, что файл «передал��я», хотя файл не передавался.
+   */
+  #parseCtrlSafe(body: Uint8Array): CtrlMessage | null {
+    try {
+      return parseCtrl(body);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.events.emit('warn', { code: 'bad-ctrl', message: `отброшено управляющее сообщение: ${message}` });
+      return null;
+    }
+  }
+
   #onFileMessage(raw: unknown): void {
     const bytes = toBytes(raw);
     if (bytes === null) return;
@@ -486,9 +508,11 @@ export class PeerLink {
 
   #dispatchCtrl(type: number, json: unknown, body: Uint8Array): void {
     switch (type) {
-      case FrameType.Json:
-        this.events.emit('ctrl', { kind: 'json', msg: parseCtrl(body) });
+      case FrameType.Json: {
+        const msg = this.#parseCtrlSafe(body);
+        if (msg !== null) this.events.emit('ctrl', { kind: 'json', msg });
         return;
+      }
       case FrameType.YjsSync:
         this.events.emit('ctrl', { kind: 'yjs-sync', data: body });
         return;
@@ -571,9 +595,11 @@ export class PeerLink {
 
   /**
    * Ждёт места в очереди файлового канала. Основа backpressure передачи файла.
-   * @returns false по таймауту или при закрытии — вызывающий обязан это учесть.
+   *
+   * Различает таймаут и закрытие: при выходе из комнаты ждать освобождения
+   * буфера нечего, и называть это зависанием передачи неверно.
    */
-  waitFileCapacity(timeoutMs: number, reason = ''): Promise<boolean> {
+  waitFileCapacity(timeoutMs: number, reason = ''): Promise<CapacityWait> {
     return this.#fileOut.waitForCapacity(timeoutMs, reason);
   }
 

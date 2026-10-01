@@ -88,12 +88,24 @@ export function transferFileName(title: string, format: 'epub' | 'fb2' | 'audio'
   const ext = extensionFor(format, mime);
   const trimmed = title.trim();
   const clean = trimmed === '' ? 'книга' : trimmed;
-  if (ext === '') return clean;
+  if (ext === '') return clip(clean);
   // Название с диска часто уже с расширением («Лекции.m4b»). Без проверки
   // получатель сохранял файл как «Лекции.m4b.m4b».
-  const lower = clean.toLowerCase();
-  if (lower.endsWith(`.${ext}`)) return clean;
-  return `${clean}.${ext}`;
+  if (clean.toLowerCase().endsWith(`.${ext}`)) return clip(clean);
+
+  // Длина ограничена протоколом (MAX_FILE_NAME_LEN = 200), а имя приходит с
+  // диска и может быть длиннее: у книг с витиеватым названием расширение
+  // выталкивало строку за лимит, и ВСЯ предложение отбрасывалось на
+  // валидации у получателя. Передача не начиналась молча.
+  return clip(`${clean.slice(0, MAX_NAME_LEN - ext.length - 1)}.${ext}`);
+}
+
+/** Лимит имени файла в протоколе. Дублируется здесь намеренно. */
+const MAX_NAME_LEN = 200;
+
+/** Обрезка по символам: счётчики в протоколе считают именно их. */
+function clip(s: string): string {
+  return s.length > MAX_NAME_LEN ? s.slice(0, MAX_NAME_LEN) : s;
 }
 
 function extensionFor(format: 'epub' | 'fb2' | 'audio', mime: string): string {

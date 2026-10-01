@@ -137,8 +137,8 @@ describe('ChannelSender: backpressure', () => {
     let sent = 0;
     for (let i = 0; i < 20; i++) {
       while (!sender.hasCapacity) {
-        const ok = await sender.waitForCapacity(1000, `чанк #${i}`);
-        expect(ok).toBe(true);
+        const wait = await sender.waitForCapacity(1000, `чанк #${i}`);
+        expect(wait.ok).toBe(true);
       }
       sender.send(new Uint8Array(CHUNK));
       sent++;
@@ -160,10 +160,11 @@ describe('ChannelSender: backpressure', () => {
     while (sender.hasCapacity) sender.send(new Uint8Array(CHUNK));
     expect(ch.bufferedAmount).toBeGreaterThan(ch.bufferedAmountLowThreshold);
 
-    const waited = sender.waitForCapacity(1000, 'проверка события');
-    await waited;
+    const waited = await sender.waitForCapacity(1000, 'проверка события');
     ch.stopTimer();
 
+    expect(waited.ok).toBe(true);
+    expect(waited.closed).toBe(false);
     // Ожидание снимается, когда очередь опустела ниже high-water — событие
     // служит лишь сигналом «проверь буфер», а не условием выхода.
     expect(ch.bufferedAmount).toBeLessThan(sender.highWaterMark);
@@ -181,10 +182,10 @@ describe('ChannelSender: backpressure', () => {
 
     while (sender.hasCapacity) sender.send(new Uint8Array(CHUNK));
     const started = Date.now();
-    const ok = await sender.waitForCapacity(2000, 'проверка опроса');
+    const wait = await sender.waitForCapacity(2000, 'проверка опроса');
     ch.stopTimer();
 
-    expect(ok).toBe(true);
+    expect(wait.ok).toBe(true);
     // Вышло по опросу, а не по событию: событие здесь физически невозможно.
     expect(ch.bufferedAmount).toBeLessThanOrEqual(sender.highWaterMark);
     expect(Date.now() - started).toBeLessThan(2000);
@@ -196,12 +197,13 @@ describe('ChannelSender: backpressure', () => {
     const { sender, trace } = makeSender(ch, { highWaterMark: 32 * 1024, lowWaterMark: 16 * 1024 });
 
     while (sender.hasCapacity) sender.send(new Uint8Array(CHUNK));
-    const ok = await sender.waitForCapacity(120, 'проверка таймаута');
+    const wait = await sender.waitForCapacity(120, 'проверка таймаута');
     ch.stopTimer();
 
     // Зависать здесь нельзя: иначе передача стоит молча и пользователь не
     // понимает, что происходит.
-    expect(ok).toBe(false);
+    expect(wait.ok).toBe(false);
+    expect(wait.closed).toBe(false);
     expect(trace.some((m) => m.includes('ТАЙМАУТ'))).toBe(true);
   });
 
@@ -213,10 +215,13 @@ describe('ChannelSender: backpressure', () => {
     while (sender.hasCapacity) sender.send(new Uint8Array(CHUNK));
     const pending = sender.waitForCapacity(5000, 'проверка закрытия');
     ch.close();
-    const ok = await pending;
+    const wait = await pending;
     ch.stopTimer();
 
-    expect(ok).toBe(false);
+    // Закрытие отличается от таймаута: вызывающий обязан это знать, иначе при
+    // выходе из комнаты пользователю показывают «буфер не опустел за 20 с».
+    expect(wait.ok).toBe(false);
+    expect(wait.closed).toBe(true);
     expect(sender.hasCapacity).toBe(false);
   });
 
@@ -227,8 +232,9 @@ describe('ChannelSender: backpressure', () => {
 
     while (sender.hasCapacity) sender.send(new Uint8Array(CHUNK));
     // Пять ожиданий подряд: если таймеры не снимаются, тестprocess не завершится.
-    await Promise.all([0, 1, 2, 3, 4].map(() => sender.waitForCapacity(2000, 'нагрузка')));
+    const results = await Promise.all([0, 1, 2, 3, 4].map(() => sender.waitForCapacity(2000, 'нагрузка')));
     ch.stopTimer();
+    expect(results.every((r) => r.ok)).toBe(true);
     expect(sender.hasCapacity).toBe(true);
   });
 });

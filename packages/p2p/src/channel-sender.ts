@@ -65,8 +65,15 @@ export interface ChannelSenderOptions {
 }
 
 interface Waiter {
-  resolve(ok: boolean): void;
+  resolve(result: CapacityWait): void;
   timer: ReturnType<typeof setTimeout> | null;
+}
+
+/** Результат ожидания места: отличить «таймаут» от «канал закрыли». */
+export interface CapacityWait {
+  ok: boolean;
+  /** Канал закрыли, место больше не появится. */
+  closed: boolean;
 }
 
 export class ChannelSender {
@@ -188,12 +195,18 @@ export class ChannelSender {
    * `bufferedAmount === 0` и не имел ни таймаута, ни обработки события по
    * порогу: на живом DataChannel он не просыпался никогда.
    *
+   * Различать «таймаут» и «закрыто» обязан вызывающий: при выходе из комнаты
+   * канал закрывается, и ждать освобождения буфера бессмысленно — там не
+   * зависание сети, а нормальное завершение. Раньше оба случая сводились к
+   * `false` с текстом «буфер не опустел за 20 с», и пользователю показывалась
+   * ошибка передачи в момент, когда он сам закрывал комнату.
+   *
    * @param timeoutMs сколько максимум ждать, мс
    * @param reason для журнала: что именно собираемся слать
    */
-  async waitForCapacity(timeoutMs: number, reason = ''): Promise<boolean> {
-    if (this.hasCapacity) return true;
-    if (this.#closed) return false;
+  async waitForCapacity(timeoutMs: number, reason = ''): Promise<CapacityWait> {
+    if (this.#closed) return { ok: false, closed: true };
+    if (this.hasCapacity) return { ok: true, closed: false };
 
     this.#waits++;
     const started = this.bufferedAmount;
@@ -201,11 +214,11 @@ export class ChannelSender {
       `${this.label}: пауза${reason === '' ? '' : ` перед ${reason}`} — буфер ${started} Б, ждём ≤ ${timeoutMs} мс`,
     );
 
-    return new Promise<boolean>((resolve) => {
+    return new Promise<CapacityWait>((resolve) => {
       const waiter: Waiter = {
-        resolve: (ok) => {
+        resolve: (r) => {
           this.#clearWaiterTimer(waiter);
-          resolve(ok);
+          resolve(r);
         },
         timer: null,
       };
@@ -214,7 +227,7 @@ export class ChannelSender {
           `${this.label}: ТАЙМАУТ ${timeoutMs} мс — буфер ${this.bufferedAmount} Б так и не опустел`,
         );
         this.#dropWaiter(waiter);
-        resolve(false);
+        resolve({ ok: false, closed: this.#closed });
       }, timeoutMs);
       waiter.timer.unref?.();
       this.#waiters.push(waiter);
@@ -264,7 +277,7 @@ export class ChannelSender {
     this.#stopPolling();
     for (const w of waiters) {
       this.#clearWaiterTimer(w);
-      w.resolve(true);
+      w.resolve({ ok: true, closed: false });
     }
   }
 
@@ -272,7 +285,7 @@ export class ChannelSender {
     const waiters = this.#waiters.splice(0, this.#waiters.length);
     for (const w of waiters) {
       this.#clearWaiterTimer(w);
-      w.resolve(false);
+      w.resolve({ ok: false, closed: true });
     }
     if (waiters.length > 0) this.#onTrace?.(`${this.label}: снято ожиданий — ${why}`);
   }

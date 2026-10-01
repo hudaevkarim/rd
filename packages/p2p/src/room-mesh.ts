@@ -21,6 +21,7 @@ import type { CtrlMessage } from '@rd/protocol';
 import type { PassKey, PeerIdentity } from '@rd/crypto';
 import { Emitter } from './emitter.js';
 import { PeerLink, type CtrlPayload, type LinkState, type SignalOut } from './peer-link.js';
+import type { CapacityWait } from './channel-sender.js';
 import type { SignalTransport } from './signal-transport.js';
 import type { RtcConfig, RtcFactory } from './transport.js';
 
@@ -429,11 +430,10 @@ export class RoomMesh {
   /**
    * Ждёт места в очереди файлового канала. Основа backpressure: без этого
    * отправитель залил бы в канал весь файл за секунду.
-   * @returns false по таймауту или при закрытии.
    */
-  waitFileCapacity(peerId: PeerId, timeoutMs: number, reason = ''): Promise<boolean> {
+  waitFileCapacity(peerId: PeerId, timeoutMs: number, reason = ''): Promise<CapacityWait> {
     const link = this.#peers.get(peerId)?.link;
-    if (link === undefined || link === null) return Promise.resolve(false);
+    if (link === undefined || link === null) return Promise.resolve({ ok: false, closed: true });
     return link.waitFileCapacity(timeoutMs, reason);
   }
 

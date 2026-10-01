@@ -194,6 +194,8 @@ export class FileTransferManager {
     this.#opts.onTrace?.(message);
   }
 
+  
+
   /** Сколько байт пир подтвердил как принятые. */
   ackedBytes(transferId: string, peerId: PeerId): number {
     return this.#acked.get(transferId)?.get(peerId) ?? 0;
@@ -473,12 +475,19 @@ export class FileTransferManager {
               `пауза буфера: ${short(peerId)} = ${buffer.buffered} Б (порог ${buffer.high}), отправлено ${offset} из ${job.offer.size}`,
             );
           }
-          const ok = await this.#opts.mesh.waitFileCapacity(
+          const wait = await this.#opts.mesh.waitFileCapacity(
             peerId,
             this.#capacityTimeoutMs,
             `чанк #${chunkIndex} (${offset} из ${job.offer.size} Б)`,
           );
-          if (!ok) {
+          if (!wait.ok) {
+            // Закрытый канал — это не зависание передачи, а выход из комнаты или
+            // обрыв. Сообщение об ошибке здесь было бы ложью: пользователь сам
+            // закрыл комнату, а ему показывали «буфер не опустел за 20 с».
+            if (wait.closed) {
+              this.#trace(`передача ${short(transferId)} → ${short(peerId)} прервана: соединение закрыто`);
+              return;
+            }
             const again = this.#opts.mesh.fileBufferOf(peerId);
             this.#fail(
               transferId,

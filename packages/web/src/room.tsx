@@ -13,6 +13,8 @@ import { useSession } from './use-session.js';
 import { Reader } from './reader.js';
 import { CommentsPanel } from './comments.js';
 import { SafetyCodes } from './safety-codes.js';
+import { AudioView } from './audio-view.js';
+import { formatTimecode } from './audio-core.js';
 
 export interface RoomProps {
   session: RoomSession;
@@ -46,6 +48,36 @@ export function Room({ session, onLeave }: RoomProps) {
 
   const index = activeBook === null ? null : session.bookIndex(activeBook);
   const progress = state?.position.progress ?? 0;
+
+  // Аудиокнига и текст — разные читалки: их нельзя смешивать в одном потоке,
+  // иначе комментарии по таймкоду оказывались бы в текстовой книге.
+  const books = state?.books ?? [];
+  const activeEntry = books.find((b) => b.id === activeBook);
+  const isAudio = activeEntry?.format === 'audio';
+  /** Якорь комментария из плеера: секунда, а не смещение в тексте. */
+  const [audioAnchor, setAudioAnchor] = useState<{ timeSec: number; quote?: string } | null>(null);
+
+  // Закрываем книгу, если её убрали из каталога (участник вышел).
+  useEffect(() => {
+    if (activeBook !== null && books.length > 0 && !books.some((b) => b.id === activeBook)) setActiveBook(null);
+  }, [activeBook, books]);
+
+  // Переключение формата сбрасывает и выделение, и якорь аудио: они из разных
+  // систем координат и вместе не имеют смысла.
+  useEffect(() => {
+    setSelection(null);
+    setAudioAnchor(null);
+  }, [activeBook]);
+
+  const submitAudioComment = useCallback(
+    (anchor: { timeSec: number; quote?: string }) => {
+      if (activeBook === null) return;
+      const text = window.prompt('Комментарий на ' + formatTimecode(anchor.timeSec));
+      if (text === null || text.trim() === '') return;
+      session.addComment({ bookId: activeBook, anchor: { kind: 'audio', ...anchor }, body: text.trim(), spoiler: false });
+    },
+    [activeBook, session],
+  );
 
   const onLeaveRoom = useCallback(() => {
     void session.stop().then(onLeave);
@@ -123,15 +155,24 @@ export function Room({ session, onLeave }: RoomProps) {
             </nav>
           )}
           <div ref={containerRef} className="min-w-0 flex-1 overflow-y-auto px-6 py-10">
-            <Reader
-              session={session}
-              bookId={activeBook}
-              index={index}
-              selection={selection}
-              goto={goto}
-              onSelection={setSelection}
-              onClearSelection={() => setSelection(null)}
-            />
+            {isAudio ? (
+              <AudioView
+                session={session}
+                bookId={activeBook}
+                player={session.hasAudio ? session.audio : null}
+                onAddComment={submitAudioComment}
+              />
+            ) : (
+              <Reader
+                session={session}
+                bookId={activeBook}
+                index={index}
+                selection={selection}
+                goto={goto}
+                onSelection={setSelection}
+                onClearSelection={() => setSelection(null)}
+              />
+            )}
           </div>
         </div>
       </section>
@@ -141,8 +182,10 @@ export function Room({ session, onLeave }: RoomProps) {
         <CommentsPanel
           session={session}
           bookId={activeBook}
-          selection={selection}
+          selection={isAudio ? null : selection}
+          audioAnchor={isAudio ? audioAnchor : null}
           onClearSelection={() => setSelection(null)}
+          onClearAudioAnchor={() => setAudioAnchor(null)}
         />
         {state.warnings.length > 0 && (
           <ul className="mt-4 space-y-1 border-t border-ink-800 pt-3 text-xs text-warn-500">
@@ -237,10 +280,12 @@ function LibraryPanel(props: {
           busy ? 'opacity-50' : ''
         }`}
       >
-        {busy ? 'Читаем файл…' : '+ добавить EPUB с этого устройства'}
+        {busy ? 'Читаем файл…' : '+ добавить EPUB или аудиокнигу'}
         <input
           type="file"
-          accept=".epub,application/epub+zip"
+          // Аудио в списке: без него диалог выбора на некоторых системах
+          // показывает только папку с изображениями.
+          accept=".epub,.fb2,application/epub+zip,.mp3,.m4a,.m4b,.aac,.ogg,.opus,.flac,audio/*"
           className="hidden"
           onChange={(e) => void onFile(e.target.files?.[0] ?? null)}
         />

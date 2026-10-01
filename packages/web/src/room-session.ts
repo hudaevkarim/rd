@@ -38,6 +38,38 @@ import {
 } from '@rd/p2p';
 import { blobSource, BookIndex, createLibraryStore, parseEpub, RoomDoc, type BookEntry, type CommentAnchor, type CommentSnapshot, type ParsedEpub } from '@rd/library';
 import { newId, type PeerDescriptor, type RoomId } from '@rd/protocol';
+import { AudioPlayer } from './audio-player.js';
+import type { RemotePosition } from './audio-core.js';
+
+
+
+/**
+ * Аудиокнига или книга.
+ *
+ * Решение принимается по типу файла И по расширению: браузер для .m4b не всегда
+ * присылает осмысленный MIME, а для .epub, наоборот, иногда присылает
+ * application/octet-stream. Проверка только по типу теряла бы такие книги.
+ */
+function looksLikeAudio(mime: string, name: string): boolean {
+  const m = mime.toLowerCase();
+  if (m.startsWith('audio/')) return true;
+  if (m.includes('mp4') || m.includes('m4b')) return true;
+  return /\.(mp3|m4a|m4b|aac|ogg|opus|flac)$/i.test(name);
+}
+
+function guessAudioMime(name: string): string {
+  if (/\.m4b$/i.test(name)) return 'audio/mp4';
+  if (/\.m4a$/i.test(name)) return 'audio/mp4';
+  if (/\.aac$/i.test(name)) return 'audio/aac';
+  if (/\.ogg$/i.test(name)) return 'audio/ogg';
+  if (/\.opus$/i.test(name)) return 'audio/ogg';
+  if (/\.flac$/i.test(name)) return 'audio/flac';
+  return 'audio/mpeg';
+}
+
+function stripAudioExtension(name: string): string {
+  return name.replace(/\.(mp3|m4a|m4b|aac|ogg|opus|flac)$/i, '').slice(0, 200) || 'Аудиокнига';
+}
 
 export type SessionStatus = 'idle' | 'deriving' | 'connecting' | 'connected' | 'reconnecting' | 'failed';
 
@@ -67,6 +99,9 @@ export interface PeerReading {
   progress: number;
   chapterIndex: number;
   blockIndex: number;
+  /** Позиция в аудиокниге, секунды. null — сосед читает текст, а не слушает. */
+  audioTimeSec: number | null;
+  audioPlaying: boolean;
 }
 
 export interface SessionState {
@@ -80,7 +115,21 @@ export interface SessionState {
   safety: Record<string, string>;
   /** Кто и где читает: идентификатор участника → позиция. */
   others: Record<string, PeerReading>;
+  /** Следует ли за чужой позицией воспроизведения. По умолчанию false. */
+  audioFollow: boolean;
 }
+
+/** Позиция воспроизведения в awareness. Всё здесь приходит из сети. */
+export interface RemoteAudioState {
+  bookId: string;
+  timeSec: number;
+  playing: boolean;
+  follow: boolean;
+  updatedAt: number;
+}
+
+/** Ключ настройки в IndexedDB: персональный, не общий для комнаты. */
+const audioFollowKey = 'audio-follow';
 
 export interface SessionOptions {
   roomId: RoomId;
@@ -114,10 +163,13 @@ export class RoomSession {
     warnings: [],
     safety: {},
     others: {},
+    audioFollow: false,
   };
 
   readonly #store = createLibraryStore();
   readonly #doc = new RoomDoc();
+  /** Плеер создаётся лениво: в комнате без аудиокниг он не нужен. */
+  #audio: AudioPlayer | null = null;
   readonly #listeners = new Set<() => void>();
   readonly #transfersByKey = new Map<string, TransferView>();
   /** Разобранные книги: разбор EPUB дорогой, поэтому кэшируем. */
@@ -167,6 +219,12 @@ export class RoomSession {
     // синхронизация с соседями увидит полное состояние.
     const saved = await session.#store.loadYState(options.roomId);
     if (saved !== null) session.#doc.applyUpdate(saved);
+
+    // Личный выбор «следовать за позицией соседей» переживает перезагрузку
+    // страницы. По умолчанию выключено: навязывание чужой позиции без
+    // явного согласия — худшее, что может сделать плеер в чужой комнате.
+    const follow = await session.#store.getSetting<boolean>(audioFollowKey).catch(() => undefined);
+    session.#patch({ audioFollow: follow === true });
 
     const descriptor: PeerDescriptor = {
       id: newId(),
@@ -359,6 +417,8 @@ export class RoomSession {
       peerId = '';
     }
     provider.setLocalField('user', { name: this.#options.name, color: this.#options.color, peerId });
+    // Плеер мог быть создан до подключения, когда peerId был ещё неизвестен.
+    this.#audio?.setPeerId(peerId);
   }
 
   // ─── Позиция и присутствие ───────────────────────────────────────────────────
@@ -377,15 +437,26 @@ export class RoomSession {
     const self = this.#parts.provider.doc.clientID;
     for (const [clientId, raw] of states) {
       if (clientId === self) continue;
-      const s = raw as { user?: { name?: string; color?: string; peerId?: string }; reading?: ReadingPosition };
+      const s = raw as {
+        user?: { name?: string; color?: string; peerId?: string };
+        reading?: ReadingPosition;
+        audio?: { timeSec?: unknown; playing?: unknown };
+      };
       const peerId = s.user?.peerId;
       if (peerId === undefined || peerId === '') continue;
+      // Позиция из awareness недоверенная: пир мог прислать что угодно. Поэтому
+      // числа приводим и зажимаем, а не берём как есть — иначе один мусорный
+      // peerId с timeSec = NaN уронил бы перерисовку всего списка.
+      const audioTime = s.audio?.timeSec;
       next[peerId] = {
         name: s.user?.name ?? 'Участник',
         color: s.user?.color ?? '#8d8579',
         progress: s.reading?.progress ?? 0,
         chapterIndex: s.reading?.chapterIndex ?? 0,
         blockIndex: s.reading?.blockIndex ?? 0,
+        audioTimeSec:
+          typeof audioTime === 'number' && Number.isFinite(audioTime) && audioTime >= 0 ? audioTime : null,
+        audioPlaying: s.audio?.playing === true,
       };
     }
     this.#patch({ others: next });
@@ -395,6 +466,13 @@ export class RoomSession {
 
   async importBook(file: File): Promise<string> {
     const bytes = new Uint8Array(await file.arrayBuffer());
+
+    // Аудиокнига не разбирается: это бинарный поток, и читать его в память
+    // ради каталога незачем. Достаточно узнать длительность, а она становится
+    // известна только после загрузки в плеер.
+    const isAudio = looksLikeAudio(file.type, file.name);
+    if (isAudio) return this.#importAudio(file, bytes);
+
     const parsed = parseEpub(bytes);
     const id = newId();
 
@@ -428,6 +506,62 @@ export class RoomSession {
       durationSec: null,
       note: '',
     });
+    this.#patch({ books: this.#doc.listBooks() });
+    return id;
+  }
+
+  /**
+   * Импорт аудиокниги.
+   *
+   * Параллельно с сохранением файла загружаем его в плеер ради длительности:
+   * без неё шкала и спойлеры не работают, а получить её больше неоткуда — в
+   * MP3 и M4B она в заголовке файла, и соседи её тоже не знают.
+   */
+  async #importAudio(file: File, bytes: Uint8Array): Promise<string> {
+    const id = newId();
+    const mime = file.type === '' ? guessAudioMime(file.name) : file.type;
+    const blob = new Blob([bytes.slice().buffer as ArrayBuffer], { type: mime });
+
+    await this.#store.putBook({
+      id,
+      roomId: this.roomId,
+      title: stripAudioExtension(file.name),
+      author: '',
+      format: 'audio',
+      size: file.size,
+      mime,
+      root: '',
+      blob,
+      received: file.size,
+      complete: true,
+      savedAt: Date.now(),
+      lastOpenedAt: null,
+    });
+
+    this.#doc.addBook({
+      id,
+      title: stripAudioExtension(file.name),
+      author: '',
+      format: 'audio',
+      size: file.size,
+      mime,
+      root: '',
+      addedBy: this.selfId === '' ? 'me' : this.selfId,
+      durationSec: null,
+      note: '',
+    });
+
+    try {
+      await this.audio.load({ bookId: id, title: stripAudioExtension(file.name), blob, mime });
+      const duration = this.audio.durationSec;
+      if (duration > 0) this.setAudioDuration(id, duration);
+    } catch {
+      // Файл сохранился, но плеер его не взял (браузер не знает формата).
+      // Это не повод отказывать в импорте: файл в каталоге, его можно
+      // передать соседям, у которых браузер другой.
+      this.#warn(`аудиофайл сохранён, но длительность определить не удалось: ${file.name}`);
+    }
+
     this.#patch({ books: this.#doc.listBooks() });
     return id;
   }
@@ -486,10 +620,135 @@ export class RoomSession {
 
   setAudioDuration(bookId: string, seconds: number): void {
     this.#audioDuration[bookId] = seconds;
+    // Длительность попадает в каталог: она нужна другим участникам для
+    // спойлеров и для шкалы, а пересчитывать её у себя каждый должен заново.
+    const entry = this.#doc.bookEntry(bookId);
+    if (entry !== undefined && entry.durationSec !== seconds) {
+      this.#doc.patchBook(bookId, { durationSec: seconds });
+      this.#patch({ books: this.#doc.listBooks() });
+    }
   }
 
   audioDuration(bookId: string): number {
-    return this.#audioDuration[bookId] ?? 0;
+    // Сначала то, что мы узнали сами: у нас длительность точная, из файла.
+    const known = this.#audioDuration[bookId];
+    if (known !== undefined && known > 0) return known;
+    // Иначе берём из каталога комнаты — его заполнил тот, кто книгу уже играл.
+    return this.#doc.bookEntry(bookId)?.durationSec ?? 0;
+  }
+
+  // ─── Аудиокнига ──────────────────────────────────────────────────────────────
+
+  /**
+   * Плеер создаётся один на сессию и переиспользуется между книгами: держать
+   * два элемента `<audio>` означало бы держать в памяти два файла.
+   */
+  get audio(): AudioPlayer {
+    if (this.#audio === null) {
+      // peerId нужен плееру сразу: он участвует в выборе, кто ведёт позицию.
+      // Без него каждый считал бы лидером другого, и пиры тянули бы друг друга.
+      this.#audio = new AudioPlayer({ peerId: this.selfId });
+    }
+    return this.#audio;
+  }
+
+  get hasAudio(): boolean {
+    return this.#audio !== null;
+  }
+
+  /**
+   * Открывает аудиокнигу: достаёт Blob из IndexedDB и отдаёт плееру.
+   * @returns false, если файл ещё не получен от участника комнаты.
+   */
+  async openAudio(bookId: string): Promise<boolean> {
+    const entry = this.#doc.bookEntry(bookId);
+    if (entry === undefined) return false;
+    const stored = await this.#store.getBook(this.roomId, bookId);
+    if (stored?.blob == null) return false;
+    await this.audio.load({
+      bookId,
+      title: entry.title,
+      blob: stored.blob,
+      mime: stored.mime === '' ? entry.mime : stored.mime,
+    });
+    return true;
+  }
+
+  /**
+   * Поддерживать ли чужую позицию. По умолчанию выключено.
+   *
+   * Значение живёт в awareness, а не в документе: это личный выбор человека, и
+   * спорить о нём через CRDT незачем. Он же сохраняется в IndexedDB, чтобы
+   * пережить перезагрузку страницы.
+   */
+  setAudioFollow(enabled: boolean): void {
+    this.audio.setFollowEnabled(enabled);
+    this.#parts.provider.setLocalField('audio', {
+      bookId: this.audio.bookId,
+      timeSec: this.audio.positionSec,
+      playing: this.audio.state === 'playing',
+      follow: enabled,
+      updatedAt: Date.now(),
+    });
+    void this.#store.setSetting(audioFollowKey, enabled).catch(() => {});
+    this.#patch({ audioFollow: enabled });
+  }
+
+  get audioFollow(): boolean {
+    return this.state.audioFollow;
+  }
+
+  /**
+   * Публикует нашу позицию и применяет чужую.
+   *
+   * Вызывается из интерфейса по таймеру: плеер сам в presence не ходит, иначе
+   * о нём пришлось бы знать слою сессии, а он и так уже знает о ней слишком
+   * много. Здесь же собираются позиции соседей из awareness.
+   */
+  syncAudioPositions(now = Date.now()): void {
+    const player = this.#audio;
+    if (player === null || player.bookId === null) return;
+
+    const remotes = this.#remoteAudioPositions();
+    // Сначала объявляемся, потом смотрим на соседей: иначе при входе в комнату
+    // мы бы несколько секунд слушали чужую позицию, не сообщив свою.
+    const mine = player.publishPosition(now);
+    if (mine !== null) {
+      this.#parts.provider.setLocalField('audio', {
+        bookId: mine.bookId,
+        timeSec: mine.timeSec,
+        playing: mine.playing,
+        follow: player.followEnabled,
+        updatedAt: now,
+      });
+    }
+    player.applyRemote(remotes, now);
+  }
+
+  /** Позиции соседей из awareness: id пира → позиция. */
+  #remoteAudioPositions(): RemotePosition[] {
+    const out: RemotePosition[] = [];
+    const states = this.#parts.provider.awareness.getStates();
+    const self = this.#parts.provider.doc.clientID;
+    for (const [clientId, raw] of states) {
+      if (clientId === self) continue;
+      const s = raw as { user?: { peerId?: string }; audio?: RemoteAudioState };
+      const peerId = s.user?.peerId;
+      const audio = s.audio;
+      // Всё из awareness недоверенное: проверяем типы, а не доверяем.
+      if (peerId === undefined || peerId === '') continue;
+      if (audio === undefined || typeof audio !== 'object') continue;
+      if (typeof audio.bookId !== 'string' || audio.bookId === '') continue;
+      const timeSec = Number(audio.timeSec);
+      if (!Number.isFinite(timeSec) || timeSec < 0) continue;
+      // Без метки времени позицию брать нельзя: по ней считается компенсация
+      // сетевой задержки, и без неё мы бы догоняли устаревшую позицию как
+      // свежую. Пропускаем такую запись целиком.
+      const updatedAt = Number(audio.updatedAt);
+      if (!Number.isFinite(updatedAt)) continue;
+      out.push({ peerId, bookId: audio.bookId, timeSec, playing: audio.playing === true, at: updatedAt });
+    }
+    return out;
   }
 
   // ─── Комментарии ─────────────────────────────────────────────────────────────
@@ -538,6 +797,10 @@ export class RoomSession {
     } catch {
       // Не смогли сохранить — не повод блокировать выход из комнаты.
     }
+    // Плеер освобождаем ДО разрыва сети: он держит Blob-ссылку на аудиокнигу, а
+    // разорванная сессия уже не сможет ни доиграть, ни досохранить позицию.
+    this.#audio?.destroy();
+    this.#audio = null;
     this.#parts.provider.destroy();
     this.#parts.transfers.stop();
     this.#parts.mesh.stop();

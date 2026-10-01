@@ -20,9 +20,25 @@ export interface CommentsPanelProps {
   bookId: string | null;
   selection: Selection | null;
   onClearSelection: () => void;
+  /**
+   * Якорь из аудиоплеера: секунда в записи.
+   *
+   * Отдельное поле, а не общий `selection`: координаты у них разные
+   * (смещение в тексте против секунды), и общий тип заставил бы проверять вид
+   * якоря в каждом месте, где он используется.
+   */
+  audioAnchor?: { timeSec: number; quote?: string } | null;
+  onClearAudioAnchor?: () => void;
 }
 
-export function CommentsPanel({ session, bookId, selection, onClearSelection }: CommentsPanelProps) {
+export function CommentsPanel({
+  session,
+  bookId,
+  selection,
+  onClearSelection,
+  audioAnchor = null,
+  onClearAudioAnchor,
+}: CommentsPanelProps) {
   const state = useSession(session);
   const [draft, setDraft] = useState('');
   const [spoiler, setSpoiler] = useState(false);
@@ -51,10 +67,13 @@ export function CommentsPanel({ session, bookId, selection, onClearSelection }: 
   const submit = (parentId: string | null): void => {
     const text = draft.trim();
     if (text === '' || bookId === null) return;
-    // Якорь строится из выделения; без выделения комментарий идёт от текущей
-    // позиции — так удобно «начать с этого места».
+    // Якорь строится из того, что выделили: в тексте — фрагмент, в аудио —
+    // секунда. Без выделения комментарий идёт от текущей позиции: так удобно
+    // «начать с этого места».
     let anchor: CommentAnchor;
-    if (parentId === null && selection !== null && book !== null) {
+    if (parentId === null && audioAnchor !== null) {
+      anchor = { kind: 'audio', timeSec: audioAnchor.timeSec, ...(audioAnchor.quote ? { quote: audioAnchor.quote } : {}) };
+    } else if (parentId === null && selection !== null && book !== null) {
       anchor =
         createTextAnchor(book, selection.chapterIndex, selection.blockIndex, selection.start, selection.end) ?? {
           kind: 'text',
@@ -84,6 +103,7 @@ export function CommentsPanel({ session, bookId, selection, onClearSelection }: 
     setSpoiler(false);
     setReplyTo(null);
     onClearSelection();
+    onClearAudioAnchor?.();
   };
 
   return (
@@ -97,7 +117,12 @@ export function CommentsPanel({ session, bookId, selection, onClearSelection }: 
       ) : (
         <>
           <div className="mb-3 rounded-md border border-ink-800 bg-ink-950/60 p-2">
-            {selection === null ? (
+            {audioAnchor !== null ? (
+              <p className="px-1 pb-1 text-[11px] text-warn-500">
+                на {formatTimecode(audioAnchor.timeSec)}
+                {audioAnchor.quote !== undefined && audioAnchor.quote !== '' ? ` — «${audioAnchor.quote.slice(0, 60)}»` : ''}
+              </p>
+            ) : selection === null ? (
               <p className="px-1 text-[11px] text-ink-600">
                 Выделите фрагмент в тексте — комментарий привяжется к нему. Без выделения — к текущему месту.
               </p>
@@ -283,12 +308,13 @@ function formatTime(ms: number): string {
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
-/** Таймкод в формате ч:мм:сс / мм:сс. */
-export function formatTimecode(seconds: number): string {
-  const s = Math.max(0, Math.floor(seconds));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
-  return `${m}:${String(sec).padStart(2, '0')}`;
-}
+/**
+ * Таймкод в формате ч:мм:сс / мм:сс.
+ *
+ * Переопределение из audio-core: там эта функция живёт вместе с остальной
+ * логикой времени и покрыта тестами. Здесь она нужна только для показа в
+ * комментариях, поэтому дублировать поведение (и риск разойтись с ним) смысла
+ * нет. Реэкспорт, а не обёртка: так поиск по таймкоду находит одно определение.
+ */
+import { formatTimecode } from './audio-core.js';
+export { formatTimecode };

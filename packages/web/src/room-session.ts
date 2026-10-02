@@ -107,6 +107,31 @@ export interface ReadingPosition {
   progress: number;
 }
 
+/**
+ * Моё место в конкретной книге.
+ *
+ * ─── Почему их много, а не одна ───────────────────────────────────────────────
+ *
+ * Позиция в `state.position` — это «где я сейчас читаю»: она нужна соседям
+ * (присутствие), спойлерам и проценту прочтения. Но держать в ней место для
+ * чтения **всех** книг нельзя: одна позиция на комнату означала, что стоит
+ * открыть вторую книгу — и место в первой прочитать заново придётся с начала.
+ *
+ * Эти записи живут в IndexedDB, а не в CRDT-документе, и это осознанно:
+ * документ синхронизируется с соседями, и личная история чтения в нём стала бы
+ * читаемой любым участником комнаты. Присутствие и так рассказывает соседям,
+ * где я сейчас, но не где я был за все прочитанные книги.
+ */
+export interface BookPosition {
+  bookId: string;
+  chapterIndex: number;
+  blockIndex: number;
+  /** Секунда остановки в аудиокниге; null для текстовой. */
+  audioSec: number | null;
+  progress: number;
+  updatedAt: number;
+}
+
 export interface PeerReading {
   name: string;
   color: string;
@@ -140,6 +165,14 @@ export interface SessionState {
    * после перезагрузки страницы.
    */
   localFiles: string[];
+  /**
+   * Где я остановился в каждой книге: id книги → место.
+   *
+   * Личное и локальное (IndexedDB), в отличие от `position`, которое видно
+   * соседям. Ключ — id книги, поэтому переключение между книгами не теряет
+   * место ни в одной из них.
+   */
+  positions: Record<string, BookPosition>;
 }
 
 /** Позиция воспроизведения в awareness. Всё здесь приходит из сети. */
@@ -153,6 +186,10 @@ export interface RemoteAudioState {
 
 /** Ключ настройки в IndexedDB: персональный, не общий для комнаты. */
 const audioFollowKey = 'audio-follow';
+/** Префикс ключа личных мест чтения; комната добавляется к нему. */
+const positionsKeyPrefix = 'positions:';
+/** Как часто личные места чтения сбрасываются на диск. */
+const POSITIONS_SAVE_DEBOUNCE_MS = 800;
 
 /**
  * Подменяемые части окружения.
@@ -205,6 +242,7 @@ export class RoomSession {
     others: {},
     audioFollow: false,
     localFiles: [],
+    positions: {},
   };
 
   /** Заменяемое окружение. Тесты подставляют своё: см. SessionDeps. */
@@ -232,9 +270,12 @@ export class RoomSession {
   readonly #indexes = new Map<string, BookIndex>();
   readonly #audioDuration: Record<string, number> = {};
   readonly #options: SessionOptions;
+  /** Личные места чтения по книгам; источник — IndexedDB, не CRDT. */
+  readonly #positions = new Map<string, BookPosition>();
 
   #parts!: Parts;
   #saveTimer: ReturnType<typeof setTimeout> | null = null;
+  #positionsTimer: ReturnType<typeof setTimeout> | null = null;
   #lastPresenceAt = 0;
   #stopped = false;
   /**
@@ -289,6 +330,8 @@ export class RoomSession {
     // явного согласия — худшее, что может сделать плеер в чужой комнате.
     const follow = await session.#store.getSetting<boolean>(audioFollowKey).catch(() => undefined);
     session.#patch({ audioFollow: follow === true });
+    // Личные места чтения — тоже личное, поэтому тоже с диска и не из CRDT.
+    await session.#loadPositions();
     // Каталог комнаты уже загружен: сверяем его с тем, что лежит на диске,
     // иначе после перезагрузки все книги выглядят «не полученными».
     await session.refreshLocalFiles().catch(() => []);
@@ -519,10 +562,119 @@ export class RoomSession {
 
   setPosition(bookId: string | null, chapterIndex: number, blockIndex: number, progress: number): void {
     this.#patch({ position: { bookId, chapterIndex, blockIndex, progress } });
+    // Личное место в книге запоминаем всегда, даже когда публикация в
+    // присутствие прорежена троттлингом: троттлинг экономит трафик, а место
+    // чтения нужно сохранять точно.
+    if (bookId !== null) this.#rememberPosition(bookId, { chapterIndex, blockIndex, audioSec: null, progress });
     const now = Date.now();
     if (now - this.#lastPresenceAt < PRESENCE_THROTTLE_MS) return;
     this.#lastPresenceAt = now;
     this.#parts.provider.setLocalField('reading', { bookId, chapterIndex, blockIndex, progress });
+  }
+
+  /**
+   * Запоминает место остановки в аудиокниге.
+   *
+   * Отдельный метод, а не `setPosition` с нулями: у аудио нет ни глав, ни
+   * блоков, и забивать их нулями значило бы при возврате в книгу прыгать в
+   * начало. Секунды хранятся отдельно от `progress`, потому что глобальная
+   * доля округляется и на длинной записи даёт заметную ошибку.
+   */
+  setAudioPosition(bookId: string, seconds: number, progress: number): void {
+    const safe = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+    // Позицию соседям публикует syncAudioPositions, здесь только своё место.
+    this.#patch({ position: { bookId, chapterIndex: 0, blockIndex: 0, progress } });
+    this.#rememberPosition(bookId, { chapterIndex: 0, blockIndex: 0, audioSec: safe, progress });
+  }
+
+  /** Где я остановился в этой книге; null — книгу ещё не открывали. */
+  positionOf(bookId: string): BookPosition | null {
+    return this.#positions.get(bookId) ?? null;
+  }
+
+  /**
+   * Обновляет личное место в книге и планирует запись на диск.
+   *
+   * Перезапись целиком, а не слияние по полям: у позиции есть один смысл —
+   * «где я остановился», и смешивание старой главы с новой секундой дало бы
+   * бессмысленное значение.
+   */
+  #rememberPosition(
+    bookId: string,
+    patch: { chapterIndex: number; blockIndex: number; audioSec: number | null; progress: number },
+  ): void {
+    const next: BookPosition = {
+      bookId,
+      chapterIndex: Math.max(0, Math.trunc(patch.chapterIndex)),
+      blockIndex: Math.max(0, Math.trunc(patch.blockIndex)),
+      audioSec: patch.audioSec,
+      progress: clamp01(patch.progress),
+      updatedAt: Date.now(),
+    };
+    const prev = this.#positions.get(bookId);
+    // Прокрутка шлёт позицию десятки раз в секунду, а писать в IndexedDB на
+    // каждый абзац нельзя. Поэтому запись идёт только при заметном сдвиге.
+    if (
+      prev !== undefined &&
+      prev.chapterIndex === next.chapterIndex &&
+      prev.blockIndex === next.blockIndex &&
+      Math.abs((prev.audioSec ?? -1) - (next.audioSec ?? -1)) < 5 &&
+      Math.abs(prev.progress - next.progress) < 0.001
+    ) {
+      return;
+    }
+    this.#positions.set(bookId, next);
+    this.#patch({ positions: { ...this.state.positions, [bookId]: next } });
+    this.#schedulePositionsSave();
+  }
+
+  /**
+   * Поднимает сохранённые места чтения.
+   *
+   * Данные с диска считаются своими, но всё равно проверяются:IndexedDB мог
+   * остаться со старой версией или с чужой комнаты, и битая запись не должна
+   * уронить открытие книги (например, главой из миллиона или `NaN` в секундах).
+   */
+  async #loadPositions(): Promise<void> {
+    const raw = await this.#store.getSetting<Record<string, unknown>>(`${positionsKeyPrefix}${this.roomId}`).catch(
+      () => undefined,
+    );
+    if (raw === undefined || raw === null || typeof raw !== 'object') return;
+    const clean: Record<string, BookPosition> = {};
+    for (const [bookId, value] of Object.entries(raw)) {
+      const pos = sanitizeBookPosition(bookId, value);
+      if (pos !== null) {
+        this.#positions.set(bookId, pos);
+        clean[bookId] = pos;
+      }
+    }
+    if (Object.keys(clean).length > 0) this.#patch({ positions: clean });
+  }
+
+  #schedulePositionsSave(): void {
+    if (this.#positionsTimer !== null) clearTimeout(this.#positionsTimer);
+    this.#positionsTimer = setTimeout(() => {
+      this.#positionsTimer = null;
+      this.flushPositions();
+    }, POSITIONS_SAVE_DEBOUNCE_MS);
+    this.#positionsTimer.unref?.();
+  }
+
+  /**
+   * Сбрасывает личные места на диск.
+   *
+   * Вызывается по таймеру и при выходе из комнаты: незаписанная позиция —
+   * это как раз та потерянная глава, ради которой всё затевалось.
+   */
+  flushPositions(): void {
+    if (this.#positionsTimer !== null) {
+      clearTimeout(this.#positionsTimer);
+      this.#positionsTimer = null;
+    }
+    if (this.#positions.size === 0) return;
+    const snapshot: Record<string, BookPosition> = {};
+    for (const [id, pos] of this.#positions) snapshot[id] = pos;
+    void this.#store.setSetting(`${positionsKeyPrefix}${this.roomId}`, snapshot).catch(() => {});
   }
 
   #rebuildPresence(): void {
@@ -949,6 +1101,11 @@ export class RoomSession {
     }
     // Плеер освобождаем ДО разрыва сети: он держит Blob-ссылку на аудиокнигу, а
     // разорванная сессия уже не сможет ни доиграть, ни досохранить позицию.
+    //
+    // Позицию воспроизведения снимаем до `destroy()`: после него `positionSec`
+    // уже ничего не вернёт, и место остановки в аудиокниге потерялось бы.
+    this.#saveAudioPosition();
+    this.flushPositions();
     this.#audio?.destroy();
     this.#audio = null;
     this.#parts.provider.destroy();
@@ -957,11 +1114,30 @@ export class RoomSession {
     this.#listeners.clear();
   }
 
+  /** Запоминает, на какой секунде остановился плеер, если он что-то играет. */
+  #saveAudioPosition(): void {
+    const player = this.#audio;
+    if (player === null || player.bookId === null) return;
+    const duration = player.durationSec;
+    const progress = duration > 0 ? player.positionSec / duration : 0;
+    this.setAudioPosition(player.bookId, player.positionSec, progress);
+  }
+
   // ─── Внутреннее ──────────────────────────────────────────────────────────────
 
+  /**
+   * Все комментарии комнаты, без фильтра по книге.
+   *
+   * ─── Почему фильтр здесь, а не здесь же ─────────────────────────────────────
+   *
+   * Раньше список считался для книги из `state.position` — то есть для книги,
+   * которую я читаю **сейчас**. Открытая в интерфейсе книга от этого не
+   * зависит, поэтому панель показывала чужие комментарии и обновлялась только
+   * тогда, когда что-то менялось в документе (то есть когда пользователь что-то
+   * дописывал). Фильтр по открытой книге делает панель (`CommentsPanel`).
+   */
   #comments(): CommentSnapshot[] {
-    const { bookId } = this.state.position;
-    return bookId === null ? [] : this.#doc.commentsForBook(bookId);
+    return this.#doc.commentsForRoom();
   }
 
   #findTransfer(key: string): TransferView | undefined {
@@ -996,6 +1172,45 @@ function toHex(bytes: Uint8Array): string {
   let out = '';
   for (const b of bytes) out += b.toString(16).padStart(2, '0');
   return out;
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+/**
+ * Приводит запись с диска к `BookPosition` или отбрасывает её.
+ *
+ * Данные из IndexedDB — свои, но недоверенные: база могла остаться от прежней
+ * версии или от другой комнаты. Битое место опаснее отсутствующего — с ним
+ * читалка попыталась бы открыть главу из миллиона или перемотать аудио на
+ * `NaN` секунд.
+ */
+function sanitizeBookPosition(bookId: string, value: unknown): BookPosition | null {
+  if (typeof bookId !== 'string' || bookId === '') return null;
+  if (typeof value !== 'object' || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const num = (raw: unknown): number | null => {
+    const n = Number(raw);
+    return typeof raw === 'number' && Number.isFinite(n) ? n : null;
+  };
+  const chapterIndex = num(v['chapterIndex']);
+  const blockIndex = num(v['blockIndex']);
+  const progress = num(v['progress']);
+  const audioSecRaw = num(v['audioSec']);
+  const updatedAt = num(v['updatedAt']);
+  if (chapterIndex === null || blockIndex === null) return null;
+  // Главы и блоки — индексы, а не доли: округляем и зажимаем, иначе старый или
+  // чужой индекс ушёл бы в запрос несуществующей главы.
+  return {
+    bookId,
+    chapterIndex: Math.max(0, Math.trunc(chapterIndex)),
+    blockIndex: Math.max(0, Math.trunc(blockIndex)),
+    audioSec: audioSecRaw === null ? null : Math.max(0, audioSecRaw),
+    progress: clamp01(progress ?? 0),
+    updatedAt: updatedAt ?? 0,
+  };
 }
 
 export { CHUNK_SIZE };

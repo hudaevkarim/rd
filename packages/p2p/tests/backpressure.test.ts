@@ -203,11 +203,15 @@ describe('передача файла на ограниченном канале
     // Без журнала диагностика сводится к «передача не идёт», а по исходному
     // багу это была зависшая блокировка — её невозможно отличить по картинке.
     const traces: string[] = [];
-    const pair = await makePair({ mode: 'throttled', bytesPerTick: 4 * 1024 });
+    // Сеть заметно медленнее отправителя, но не настолько, чтобы время теста
+    // зависело от скорости машины. Раньше здесь было 4 КиБ за тик и 900 КиБ
+    // файла: это ~220 тиков по 1 мс плюс ожидания, и на загруженной машине тест
+    // доходил до потолка 60 с, не проверив ничего. Свойство, которое тут
+    // проверяется, — СОДЕРЖИМОЕ журнала, а для него достаточно файла заметно
+    // больше окна (256 КиБ) и сети, которая не успевает за отправителем.
+    const pair = await makePair({ mode: 'throttled', bytesPerTick: 16 * 1024 });
 
-    // Файл заметно больше окна (256 КиБ), иначе отправитель ни разу не
-    // притормозит и проверить журнал пауз будет не на чем.
-    const bytes = makeBytes(900_000);
+    const bytes = makeBytes(500_000);
     const source: TransferSource = {
       size: bytes.length,
       slice: async (s, e) => bytes.subarray(s, Math.min(e, bytes.length)),
@@ -258,8 +262,8 @@ describe('передача файла на ограниченном канале
     expect(joined).toMatch(/\d+\/\d+/);
     // Размер буфера отправки вместе с порогом.
     expect(joined).toMatch(/буфер \d+\/\d+/);
-    // При 4 КиБ за тик отправитель обязан был где-то притормозить: либо по окну
-    // подтверждений, либо по буферу канала.
+    // Сеть медленнее отправителя, поэтому отправитель обязан был где-то
+    // притормозить: либо по окну подтверждений, либо по буферу канала.
     expect(joined).toMatch(/пауз [1-9]\d*/);
   }, 60_000);
 
@@ -456,9 +460,152 @@ describe('передача файла на ограниченном канале
     expect(joined).toMatch(/буфер|окно|подтверд/i);
   }, 30_000);
 
-  it('не забивает канал сверх окна', async () => {
-    const pair = await makePair({ mode: 'throttled', bytesPerTick: 4 * 1024 });
-    const bytes = makeBytes(1_500_000); // ~92 чанка
+  it('слушает докачку, пока файл не подтверждён получателем', async () => {
+    // ─── Регрессия на вечно висящую передачу ────────────────────────────────────
+    //
+    // Согласие на приём — это «я готов», а не «я получил». Между ними файл ещё
+    // летит, и получатель в любой момент может обнаружить нехватку данных и
+    // попросить докачку.
+    //
+    // Раньше задача отправителя удалялась, как только все СОГЛАСИЛИСЬ принять
+    // файл. Докачка после этого приходила, но `#sending.get()` возвращал
+    // undefined, сообщение молча игнорировалось, и получатель оставался ждать
+    // недостающий кусок — без ошибки, без прогресса, навсегда.
+    //
+    // Сценарий собран руками и полностью детерминирован: получателя-менеджера
+    // здесь нет, поэтому он не пришлёт `file-finish`, и задача отправителя
+    // обязана остаться живой.
+    const pair = await makePair({ mode: 'instant' });
+    const bytes = makeBytes(200_000);
+    const size = bytes.length;
+    const source: TransferSource = { size, slice: async (s, e) => bytes.subarray(s, Math.min(e, size)) };
+
+    const sender = new FileTransferManager({
+      mesh: pair.a,
+      createSink: async () => null,
+      findPartial: async () => 0,
+      resolveSource: async () => null,
+    });
+    sender.events.on('error', () => {});
+    sender.start();
+    cleanup.push(() => sender.stop());
+
+    // Считаем чанки, дошедшие до второй стороны: они приходят событием
+    // 'fileChunk' на её ссылке.
+    let delivered = 0;
+    pair.b.events.on('fileChunk', () => {
+      delivered++;
+    });
+
+    const peerId = (pair.a.peers[0] as { id: string } | undefined)?.id ?? '';
+    const offer = await sender.share({
+      bookId: newId(),
+      name: 'книга.epub',
+      mime: 'application/epub+zip',
+      source,
+      root: await computeRoot(source, CHUNK_SIZE),
+    });
+
+    // Согласие вручную: так видно момент, начиная с которого задача обязана жить.
+    pair.a.events.emit('ctrl', {
+      peerId,
+      payload: { kind: 'json', msg: { k: 'file-accept', transferId: offer.transferId } },
+    });
+    await waitFor(() => delivered >= Math.ceil(size / CHUNK_SIZE), 'файл не долетел', 20_000);
+
+    // Отправитель всё отдал и ждёт подтверждения. Задача обязана существовать.
+    expect(sender.activeSends).toBe(1);
+
+    const before = delivered;
+    // Докачка с нуля: получатель обнаружил, что ему нужно переслать всё.
+    pair.a.events.emit('ctrl', {
+      peerId,
+      payload: { kind: 'json', msg: { k: 'file-resume', transferId: offer.transferId, offset: 0 } },
+    });
+    await waitFor(() => delivered > before, 'отправитель проигнорировал докачку', 10_000);
+
+    // И только после подтверждения задача исчезает.
+    pair.a.events.emit('ctrl', {
+      peerId,
+      payload: { kind: 'json', msg: { k: 'file-finish', transferId: offer.transferId, root: offer.root } },
+    });
+    await waitFor(() => sender.activeSends === 0, 'задача не убралась после подтверждения', 10_000);
+  }, 60_000);
+
+  it('не сообщает об ошибке при выходе из комнаты', async () => {
+    // Регрессия на сообщение, которого не должно быть.
+  //
+    // При выходе из комнаты цикл отправки просыпался уже на разорванном
+  // канале: send() бросал исключение, и пользователь получал ошибку
+  // «передача прервана: канал закрыт» в момент, когда он сам нажал «Выйти».
+  //
+  // Здесь сценарий настоящий: рвём соединение посреди передачи большого файла.
+  const pair = await makePair({ mode: 'throttled', bytesPerTick: 8 * 1024 });
+  const bytes = makeBytes(900_000);
+
+  const errors: string[] = [];
+  const sender = new FileTransferManager({
+    mesh: pair.a,
+    createSink: async () => null,
+    findPartial: async () => 0,
+    resolveSource: async () => null,
+  });
+  const receiver = new FileTransferManager({
+    mesh: pair.b,
+    createSink: async () => ({
+      received: 0,
+      hashes: async () => [],
+      write: async () => {},
+      finish: async () => {},
+      abort: async () => {},
+    }),
+    findPartial: async () => 0,
+    resolveSource: async () => null,
+  });
+  sender.events.on('error', (e) => errors.push((e as { message: string }).message));
+  receiver.events.on('error', (e) => errors.push((e as { message: string }).message));
+  sender.start();
+  receiver.start();
+  cleanup.push(() => {
+    sender.stop();
+    receiver.stop();
+  });
+
+  const source: TransferSource = {
+    size: bytes.length,
+    slice: async (s, e) => bytes.subarray(s, Math.min(e, bytes.length)),
+  };
+  await sender.share({
+    bookId: newId(),
+    name: 'выход.epub',
+    mime: 'application/epub+zip',
+    source,
+    root: await computeRoot(source, CHUNK_SIZE),
+  });
+
+  // Немного ждём, чтобы передача набрала темп, затем выходим.
+  await new Promise((r) => setTimeout(r, 120));
+
+  // Порядок как в RoomSession.stop(): сначала передачи, потом сеть.
+  sender.stop();
+  receiver.stop();
+  pair.a.stop();
+  pair.b.stop();
+
+  // Даём циклам отправки проснуться: если бы они не смотрели на флаг остановки,
+  // ошибка пришла бы именно сейчас.
+  await new Promise((r) => setTimeout(r, 300));
+  expect(errors).toEqual([]);
+});
+
+it('не забивает канал сверх окна', async () => {
+    // Размер и скорость подобраны так, чтобы тест проверял свойство, а не
+    // скорость машины. Окно 256 КиБ, файл 700 КиБ — это почти три окна, то
+    // есть backpressure точно срабатывает несколько раз. При 4 КиБ за тик файл
+    // уходил бы минуту, и на загруженной машине тест падал бы по таймауту,
+    // не проверив ничего.
+    const pair = await makePair({ mode: 'throttled', bytesPerTick: 32 * 1024 });
+    const bytes = makeBytes(700_000); // ~43 чанка
 
     const result = await transferFile(pair, bytes);
 

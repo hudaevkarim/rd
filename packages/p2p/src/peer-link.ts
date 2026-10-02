@@ -50,6 +50,7 @@ import {
 import { toHex } from '@rd/crypto';
 import { Emitter } from './emitter.js';
 import { ChannelSender, type CapacityWait } from './channel-sender.js';
+import { SerialQueue } from './serial-queue.js';
 import type { RtcConfig, RtcDataChannel, RtcFactory, RtcPeerConnection, SessionDescription } from './transport.js';
 
 /** Сколько зашифрованных кадров копим, пока идёт рукопожатие. */
@@ -147,6 +148,24 @@ export class PeerLink {
   readonly #pendingCandidates: IceCandidatePayload[] = [];
   /** Зашифрованные кадры, пришедшие до установки ключей: гонка завершения рукопожатия. */
   readonly #pendingCtrl: Uint8Array[] = [];
+  /**
+   * Порядок обработки принятых кадров — по очереди на канал.
+   *
+   * DataChannel доставляет кадры упорядоченно, и весь протокол на этом стоит:
+   * получатель файла принимает чанк только если `offset` совпал с ожидаемым, а
+   * Yjs различает обновления по порядку. Но `crypto.subtle.decrypt` асинхронен,
+   * поэтому `void aead.open(frame).then(...)` отдаёт кадры наружу в порядке
+   * завершения расшифровки, а не прихода.
+   *
+   * Это не теория: терялся ровно один чанк, дальше получатель сдвигал
+   * `expectedNext` уже не туда, отбрасывал каждый следующий чанк как
+   * «перепрыгнувший» и просил докачку с места, куда отправитель ещё не дошёл.
+   * Отправитель к этому моменту считал передачу законченной и удалял задачу,
+   * докачка игнорировалась — и передача висела вечно (≈10 % запусков на файле
+   * в 700 КБ). Подробности в `serial-queue.ts`.
+   */
+  readonly #ctrlQueue = new SerialQueue();
+  readonly #fileQueue = new SerialQueue();
 
   constructor(opts: PeerLinkOptions) {
     this.peerId = opts.peer.id;
@@ -386,7 +405,10 @@ export class PeerLink {
   }
 
   #onCtrlMessage(raw: unknown): void {
-    void this.#handleCtrl(raw);
+    // Строго по очереди: рукопожатие обязано завершиться раньше, чем будет
+    // разобран хоть один зашифрованный кадр, а порядок ctrl-сообщений значим
+    // для протокола (объявление файла раньше согласия, Yjs — по порядку).
+    this.#ctrlQueue.push(() => this.#handleCtrl(raw));
   }
 
   async #handleCtrl(raw: unknown): Promise<void> {
@@ -450,9 +472,12 @@ export class PeerLink {
       this.#fail('пришёл зашифрованный чанк до завершения рукопожатия');
       return;
     }
-    void aead
-      .open(bytes)
-      .then((opened) => {
+    // Чанки обязаны выходить строго в порядке прихода: получатель принимает
+    // только кадр с ожидаемым offset иначе просит докачку. Подробности про
+    // асинхронную расшифровку — в комментарии к #ctrlQueue.
+    this.#fileQueue.push(async () => {
+      try {
+        const opened = await aead.open(bytes);
         if (opened.chunk === undefined) {
           this.events.emit('warn', { code: 'unexpected-file-frame', message: 'в файловом канале ожидался CHUNK' });
           return;
@@ -465,8 +490,10 @@ export class PeerLink {
           offset: opened.chunk.offset,
           data: opened.body,
         });
-      })
-      .catch((err: unknown) => this.#reportFrameError(err));
+      } catch (err) {
+        this.#reportFrameError(err);
+      }
+    });
   }
 
   async #onHello(json: unknown): Promise<void> {
@@ -496,13 +523,25 @@ export class PeerLink {
     this.#setState('ready');
     this.events.emit('safety', keys.safetyCode);
 
-    // Разбираем всё, что пришло во время рукопожатия. Порядок сохранён.
+    // Разбираем всё, что пришло во время рукопожатия. Порядок сохранён, и
+    // разбор тоже строго последовательный: эти кадры пришли раньше любого
+    // кадра, который придёт после установки ключей, и выйти из очереди раньше
+    // них они не должны.
+    //
+    // Кадры, пришедшие после #installKeys, попадают в ту же очередь, но уже
+    // позже: splice выполняется синхронно, до того как #aeadCtrl стал не-null,
+    // поэтому ничего не может вклиниться между ними.
+    const aeadCtrl = this.#aeadCtrl;
     const queued = this.#pendingCtrl.splice(0, this.#pendingCtrl.length);
     for (const frame of queued) {
-      void this.#aeadCtrl
-        .open(frame)
-        .then((opened) => this.#dispatchCtrl(opened.type, opened.json, opened.body))
-        .catch((err: unknown) => this.#reportFrameError(err));
+      this.#ctrlQueue.push(async () => {
+        try {
+          const opened = await aeadCtrl.open(frame);
+          this.#dispatchCtrl(opened.type, opened.json, opened.body);
+        } catch (err) {
+          this.#reportFrameError(err);
+        }
+      });
     }
   }
 

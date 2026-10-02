@@ -57,6 +57,13 @@ export function Room({ session, onLeave }: RoomProps) {
   /** Якорь комментария из плеера: секунда, а не смещение в тексте. */
   const [audioAnchor, setAudioAnchor] = useState<{ timeSec: number; quote?: string } | null>(null);
 
+  // Оглавление текстовой книги к аудио отношения не имеет: там главы приходят
+  // из атома chpl и не совпадают с оглавлением файла. Показывать старое
+  // оглавление после переключения на плеер — значит врать пользователю.
+  useEffect(() => {
+    if (isAudio) setTocOpen(false);
+  }, [isAudio]);
+
   // Закрываем книгу, если её убрали из каталога (участник вышел).
   useEffect(() => {
     if (activeBook !== null && books.length > 0 && !books.some((b) => b.id === activeBook)) setActiveBook(null);
@@ -131,13 +138,20 @@ export function Room({ session, onLeave }: RoomProps) {
       {/* ─── Текст ─── */}
       <section className="flex min-w-0 flex-col">
         <div className="flex items-center gap-3 border-b border-ink-800 px-6 py-3 text-sm">
-          <button
-            type="button"
-            onClick={() => setTocOpen((v) => !v)}
-            className="rounded-md border border-ink-700 px-2.5 py-1 text-xs text-ink-300 hover:bg-ink-800"
-          >
-            {tocOpen ? 'Скрыть оглавление' : 'Оглавление'}
-          </button>
+          {!isAudio && (
+            <button
+              type="button"
+              onClick={() => setTocOpen((v) => !v)}
+              className="rounded-md border border-ink-700 px-2.5 py-1 text-xs text-ink-300 hover:bg-ink-800"
+            >
+              {tocOpen ? 'Скрыть оглавление' : 'Оглавление'}
+            </button>
+          )}
+          {isAudio && (
+            <span className="rounded-md border border-ink-800 px-2.5 py-1 text-xs text-ink-600">
+              Аудиокнига
+            </span>
+          )}
           <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-ink-800">
             <div className="h-full rounded-full bg-accent-600 transition-[width]" style={{ width: `${Math.round(progress * 100)}%` }} />
           </div>
@@ -145,7 +159,7 @@ export function Room({ session, onLeave }: RoomProps) {
         </div>
 
         <div className="flex min-h-0 flex-1">
-          {tocOpen && (
+          {tocOpen && !isAudio && (
             <nav className="w-64 shrink-0 overflow-y-auto border-r border-ink-800 p-4">
               <Toc
                 session={session}
@@ -156,12 +170,7 @@ export function Room({ session, onLeave }: RoomProps) {
           )}
           <div ref={containerRef} className="min-w-0 flex-1 overflow-y-auto px-6 py-10">
             {isAudio ? (
-              <AudioView
-                session={session}
-                bookId={activeBook}
-                player={session.hasAudio ? session.audio : null}
-                onAddComment={submitAudioComment}
-              />
+              <AudioView session={session} bookId={activeBook} onAddComment={submitAudioComment} />
             ) : (
               <Reader
                 session={session}
@@ -338,23 +347,21 @@ function LibraryPanel(props: {
                   {(b.size / 1024 / 1024).toFixed(1)} МБ
                 </span>
               </button>
-              <div className="mt-1 flex gap-1">
-                {!local && (
-                  <span className="rounded bg-ink-800 px-1.5 py-0.5 text-[10px] text-warn-500">
-                    файла нет — получите от участника
-                  </span>
-                )}
-                {local && (
-                  <button
-                    type="button"
-                    onClick={() => void share(b.id)}
-                    disabled={sharing === b.id}
-                    className="rounded bg-ink-800 px-1.5 py-0.5 text-[10px] text-ink-300 hover:bg-ink-700 disabled:opacity-50"
-                  >
-                    {sharing === b.id ? 'передаём…' : 'передать участникам'}
-                  </button>
-                )}
-              </div>
+              {local ? (
+                <button
+                  type="button"
+                  onClick={() => void share(b.id)}
+                  disabled={sharing === b.id}
+                  className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-md border border-accent-600/60 bg-accent-600/10 px-2 py-1.5 text-[11px] font-medium text-accent-300 transition hover:bg-accent-600/20 hover:text-accent-200 active:translate-y-px disabled:cursor-wait disabled:opacity-60"
+                >
+                  <span aria-hidden="true">⇩</span>
+                  {sharing === b.id ? 'Передаём…' : 'Передать участникам'}
+                </button>
+              ) : (
+                <p className="mt-1 rounded-md border border-warn-500/30 bg-warn-500/5 px-2 py-1.5 text-[11px] text-warn-500">
+                  Файла нет — попросите участника передать
+                </p>
+              )}
             </li>
           );
         })}

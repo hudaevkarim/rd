@@ -18,9 +18,7 @@ import { useSession } from './use-session.js';
 export interface AudioViewProps {
   session: RoomSession;
   bookId: string | null;
-  /** Плеер создаётся сессией; сюда приходит уже готовый или null. */
-  player: AudioPlayer | null;
-  /** Что сейчас в панели комментариев — см. AudioCommentAnchor. */
+  /** Что сейчас в панели комментариев. */
   onAddComment: (anchor: { timeSec: number; quote?: string }) => void;
 }
 
@@ -67,8 +65,13 @@ function usePlayerSnapshot(player: AudioPlayer | null): Snapshot {
   return snap;
 }
 
-export function AudioView({ session, bookId, player, onAddComment }: AudioViewProps) {
+export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
   const state = useSession(session);
+  // Плеер берём у сессии: он создаётся лениво, и получатель аудиофайла к этому
+  // моменту его ещё не трогал. Раньше проверка `session.hasAudio` шла перед
+  // обращением к `session.audio`, то есть к геттеру, который его создаёт, —
+  // и у получателя экран навсегда застревал на «Готовим плеер…».
+  const player = useMemo(() => session.audio, [session]);
   const snap = usePlayerSnapshot(player);
   const [status, setStatus] = useState<string | null>(null);
   const [followHint, setFollowHint] = useState<string | null>(null);
@@ -81,15 +84,18 @@ export function AudioView({ session, bookId, player, onAddComment }: AudioViewPr
   const comments = useMemo(
     () =>
       (state?.comments ?? [])
+        // Фильтр по книге обязателен: список в сессии содержит комментарии всей
+        // комнаты, и без него в плеере собирались бы таймкоды чужой книги.
+        .filter((c) => c.bookId === bookId)
         .filter((c): c is CommentSnapshot & { anchor: AudioAnchor } => c.anchor.kind === 'audio')
         .sort((a, b) => a.anchor.timeSec - b.anchor.timeSec),
-    [state?.comments],
+    [bookId, state?.comments],
   );
-  const duration = player?.durationSec ?? session.audioDuration(bookId ?? '');
+  const duration = player.durationSec > 0 ? player.durationSec : session.audioDuration(bookId ?? '');
 
   // Открываем книгу один раз на bookId.
   useEffect(() => {
-    if (bookId === null || player === null) return;
+    if (bookId === null) return;
     if (openedRef.current === bookId) return;
     openedRef.current = bookId;
     let cancelled = false;
@@ -100,29 +106,37 @@ export function AudioView({ session, bookId, player, onAddComment }: AudioViewPr
     return () => {
       cancelled = true;
     };
-  }, [bookId, player, session]);
+  }, [bookId, session]);
 
-  // Восстанавливаем сохранённую позицию книги.
-  const [restored, setRestored] = useState(false);
+  /**
+   * Возврат на секунду, на которой остановились в ЭТОЙ аудиокниге.
+   *
+   * Раньше позиция бралась из заметки книги в каталоге комнаты — то есть из
+   * значения, общего для всех участников. Своё место там не выжить: оно
+   * обнулялось чужой перемоткой и не переживало перезагрузку страницы.
+   * Теперь это личная запись в IndexedDB (см. `RoomSession.positionOf`).
+   */
+  const [restoredFor, setRestoredFor] = useState<string | null>(null);
   useEffect(() => {
-    if (restored || player === null || bookId === null) return;
+    if (bookId === null || restoredFor === bookId) return;
     if (player.state === 'idle') return;
-    const note = state?.books.find((b) => b.id === bookId)?.note ?? '';
-    const seconds = parseProgressNote(note);
+    setRestoredFor(bookId);
+    const seconds = session.positionOf(bookId)?.audioSec ?? null;
     if (seconds !== null && seconds > 0) player.seek(seconds);
-    setRestored(true);
-  }, [bookId, player, restored, state?.books]);
+  }, [bookId, player, restoredFor, session]);
 
   // Слежение за соседями и публикация своей позиции.
   useEffect(() => {
-    if (player === null || bookId === null) return;
+    if (bookId === null) return;
     const offSynced = player.events.on('synced', (e) => {
       const info = e as { reason: string; leaderId: string | null };
       setFollowHint(info.leaderId === null ? null : `${info.reason} (участник ${info.leaderId.slice(0, 4)})`);
     });
     const timer = setInterval(() => {
       session.syncAudioPositions();
-      session.setPosition(bookId, 0, 0, duration > 0 ? snap.currentSec / duration : 0);
+      // Именно setAudioPosition, а не setPosition с нулями: у аудио нет ни глав,
+      // ни блоков, и запись с нулями затирала бы место в главе текста.
+      session.setAudioPosition(bookId, snap.currentSec, duration > 0 ? snap.currentSec / duration : 0);
     }, 1500);
     return () => {
       offSynced();
@@ -132,9 +146,6 @@ export function AudioView({ session, bookId, player, onAddComment }: AudioViewPr
 
   if (bookId === null) {
     return <p className="mx-auto max-w-md pt-24 text-center text-sm text-ink-600">Выберите аудиокнигу в списке слева.</p>;
-  }
-  if (player === null || !session.hasAudio) {
-    return <p className="mx-auto max-w-md pt-24 text-center text-sm text-ink-500">Готовим плеер…</p>;
   }
 
   const pct = progressPercent(snap.currentSec, snap.durationSec);
@@ -297,19 +308,6 @@ export function AudioView({ session, bookId, player, onAddComment }: AudioViewPr
       </section>
     </div>
   );
-}
-
-/**
- * Сохранённая позиция хранится как доля 0..1.
- *
- * Не в секундах: у разных участников одна и та же книга может быть отдана в
- * разной битности, и时长 может отличаться на доли секунды. Доля переживает это.
- */
-function parseProgressNote(note: string): number | null {
-  if (note === '') return null;
-  const ratio = Number(note);
-  if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) return null;
-  return ratio;
 }
 
 export type { RemotePosition };

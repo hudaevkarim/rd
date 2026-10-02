@@ -1,6 +1,7 @@
 export * from './transport.js';
 export * from './emitter.js';
 export * from './channel-sender.js';
+export * from './serial-queue.js';
 export * from './peer-link.js';
 export * from './signal-transport.js';
 export * from './room-mesh.js';

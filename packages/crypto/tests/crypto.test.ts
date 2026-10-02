@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { newId, FrameType, CHUNK_SIZE } from '@rd/protocol';
+import { newId, FrameType, CHUNK_SIZE, REPLAY_WINDOW } from '@rd/protocol';
 import {
   AeadChannel,
   AeadError,
@@ -299,6 +299,68 @@ describe('AEAD-канал', () => {
     for (const frame of frames) await b.open(frame);
     expect(b.stats.opened).toBe(3);
     expect(b.stats.rejected).toBe(0);
+  });
+
+  it('принимает кадр, задержавшийся на один счётчик, после следующего', async () => {
+    // ─── Регрессия на баг, рвавший соединение само у себя ──────────────────────
+    //
+    // Кадры уходят в канал в порядке ЗАВЕРШЕНИЯ шифрования, а счётчики выдаются
+    // в порядке вызовов. Разница в один кадр — самый частый случай: она
+    // возникает всякий раз, когда два управляющих кадра шифруются одновременно
+    // (sync + awareness + ctrl JSON при любой активности Yjs).
+    //
+    // Окно переигрывания сдвигалось на `diff`, а не на `diff + 1`, поэтому бит
+    // «счётчик recvNext-1 принят» после приёма N вставал на место счётчика N-1.
+    // Настоящий N-1 приходил следующим и отбрасывался как повтор:
+    //
+    //     ... 46, 47, 49, 48   ← 48 отброшен как «повтор», которого не было
+    //
+    // PeerLink считал это атакой и рвал соединение вместе с идущей передачей
+    // файла. Тест ниже повторяет ровно этот порядок.
+    const { a, b } = await channels();
+    const frames: Uint8Array[] = [];
+    for (let i = 0; i < 60; i++) {
+      frames.push(await a.sealBody(FrameType.Json, new Uint8Array([i & 0xff])));
+    }
+    // Всё по порядку, кроме последней пары: 59 приходит раньше 58.
+    const order = [...frames.slice(0, 58), frames[59] as Uint8Array, frames[58] as Uint8Array];
+    for (const frame of order) await b.open(frame);
+
+    expect(b.stats.rejected).toBe(0);
+    expect(b.stats.opened).toBe(60);
+  });
+
+  it('по-прежнему ловит повтор кадра, задержавшегося на один счётчик', async () => {
+    // Проверка на то, что исправление сдвига не ослабило защиту от повторов.
+    const { a, b } = await channels();
+    const frames: Uint8Array[] = [];
+    for (let i = 0; i < 10; i++) {
+      frames.push(await a.sealBody(FrameType.Json, new Uint8Array([i])));
+    }
+    for (let i = 0; i < 10; i++) {
+      if (i === 8) continue; // пропуск 8: 9 придёт первым
+      await b.open(frames[i] as Uint8Array);
+    }
+    // Настоящий пропуск — принят.
+    await expect(b.open(frames[8] as Uint8Array)).resolves.toBeDefined();
+    // Его же повтор — отброшен.
+    await expect(b.open(frames[8] as Uint8Array)).rejects.toThrow(/повтор/);
+  });
+
+  it('не принимает переигрыш за пределами окна', async () => {
+    // Кадр, отставший больше чем на REPLAY_WINDOW, должен отбрасываться: иначе
+    // атакующий может подсунуть старый кадр с валидным тегом.
+    const { a, b } = await channels();
+    const frames: Uint8Array[] = [];
+    for (let i = 0; i < REPLAY_WINDOW + 4; i++) {
+      frames.push(await a.sealBody(FrameType.Json, new Uint8Array([i & 0xff])));
+    }
+    await b.open(frames[0] as Uint8Array);
+    // Уходим далеко вперёд, чтобы первый кадр выпал из окна.
+    for (let i = 1; i <= REPLAY_WINDOW + 3; i++) {
+      await b.open(frames[i] as Uint8Array);
+    }
+    await expect(b.open(frames[0] as Uint8Array)).rejects.toThrow(/повтор|старый/);
   });
 
   it('не пускает кадры из чужой сессии с тем же ключом', async () => {

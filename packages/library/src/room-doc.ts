@@ -271,6 +271,20 @@ export class RoomDoc {
     return out.sort((a, b) => a.createdAt - b.createdAt);
   }
 
+  /**
+   * Все комментарии комнаты, отсортированные по времени создания.
+   *
+   * Нужно интерфейсу: панель фильтрует по открытой книге сама, иначе список
+   * зависел бы от того, какую книгу читает сессия, а не от того, какая открыта
+   * в окне. При переключении книги список обязан меняться сразу, без
+   * ожидания правки в документе.
+   */
+  commentsForRoom(): CommentSnapshot[] {
+    const out: CommentSnapshot[] = [];
+    for (const node of this.comments.values()) out.push(readComment(node));
+    return out.sort((a, b) => a.createdAt - b.createdAt);
+  }
+
   /** Группировка в треды: корневые комментарии с вложенными ответами. */
   threadsForBook(bookId: string): Array<{ root: CommentSnapshot; replies: CommentSnapshot[] }> {
     const all = this.commentsForBook(bookId);

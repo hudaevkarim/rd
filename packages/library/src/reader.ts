@@ -16,7 +16,7 @@
  * копируется, поэтому там стоит отдельная проверка схемы.
  */
 
-import { INLINE_TAGS, type EpubBlock, type ParsedEpub } from './epub.js';
+import { INLINE_TAGS, type EpubBlock, type EpubChapter, type ParsedEpub } from './epub.js';
 import { isElement, isText, type XmlElement, type XmlNode } from './xml.js';
 
 /** Разрешённые схемы ссылок. `data:` и `javascript:` исключены намеренно. */
@@ -182,6 +182,47 @@ export function renderChapter(chapter: { blocks: EpubBlock[] }, opts: RenderOpti
     if (el !== null) fragment.appendChild(el);
   }
   return fragment;
+}
+
+/**
+ * Даст ли блок видимый элемент.
+ *
+ * `renderBlock` возвращает null для пустых абзацев и картинок без подписи, и на
+ * практике встречаются главы, где ВСЕ блоки такие: страница с обложкой,
+ * файл с одним `<img>` или набор пустых `<p>` от вёрстки. Такая глава
+ * рендерится в пустой `<article>` — страница выглядит сломанной, и единственный
+ * способ добраться до текста — жать «Следующая».
+ *
+ * Проверка дублирует условие в renderBlock, и это намеренно: правило «пустой
+ * блок не виден» должно быть в одном месте, иначе они разъедутся.
+ */
+export function isBlockVisible(block: EpubBlock): boolean {
+  if (block.kind === 'hr') return true;
+  if (block.text.trim() !== '') return true;
+  // Блок с одной картинкой и без подписи тоже даёт пустой элемент.
+  return false;
+}
+
+/** Есть ли в главе хоть один видимый блок. */
+export function hasVisibleBlocks(chapter: { blocks: EpubBlock[] } | undefined): boolean {
+  return chapter !== undefined && chapter.blocks.some(isBlockVisible);
+}
+
+/**
+ * Первая глава с видимым текстом, начиная с `from`.
+ *
+ * Возвращает `from`, если у него есть текст, иначе ищет дальше. Используется
+ * читалкой при открытии книги: иначе пользователь попадает на пустую страницу
+ * и не понимает, что произошло.
+ */
+export function firstVisibleChapter(
+  book: { chapters: EpubChapter[] },
+  from: number,
+): number {
+  for (let i = Math.max(0, from); i < book.chapters.length; i++) {
+    if (hasVisibleBlocks(book.chapters[i])) return i;
+  }
+  return Math.max(0, Math.min(from, Math.max(0, book.chapters.length - 1)));
 }
 
 export type { XmlElement };

@@ -19,7 +19,9 @@ export default defineConfig({
     },
   },
   test: {
-    include: ['packages/*/tests/**/*.test.ts'],
+    // `.tsx` нужен для тестов компонентов: без DOM не проверить, что текст
+    // главы действительно появился на странице.
+    include: ['packages/*/tests/**/*.test.ts', 'packages/*/tests/**/*.test.tsx'],
     environment: 'node',
     testTimeout: 20_000,
     hookTimeout: 20_000,

@@ -161,8 +161,31 @@ export class FileTransferManager {
   readonly #receiving = new Map<string, ReceiveJob>();
   /** Пиры, уже подтвердившие получение. */
   readonly #accepted = new Map<string, Set<PeerId>>();
+  /**
+   * Пиры, подтвердившие, что файл у них целиком (пришло `file-finish`).
+   *
+   * Отдельные от `#accepted`, и это принципиально. Согласие на приём — это
+   * «я готов», а не «я получил»: между ними файл ещё летит, и получатель в
+   * любой момент может обнаружить нехватку данных и попросить докачку.
+   *
+   * Раньше задача удалялась по `#accepted`, то есть сразу после того, как все
+   * согласились. Докачка после этого приходила в `#sending.get(...)` и
+   * молча игнорировалась (`job === undefined` → `return`), а получатель тем
+   * временем ждал недостающий кусок вечно: ни ошибки, ни прогресса, ни конца.
+   */
+  readonly #verified = new Map<string, Set<PeerId>>();
   readonly #offerTimers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #unsubscribe: Array<() => void> = [];
+  /**
+   * Менеджер остановлен (пользователь вышел из комнаты).
+   *
+   * Отдельный флаг, а не проверка `this.#sending.size === 0`: у отправки есть
+   * окно, и пока файл качается, задача жива. При выходе из комнаты цикл отправки
+   * просыпался уже на разорванном канале, `send()` бросал исключение, и
+   * пользователь получал ошибку «передача прервана» в момент, когда он сам
+   * выходил. Ошибки не было бы, если бы цикл заметил остановку до отправки.
+   */
+  #stopped = false;
   /**
    * Очередь обработки входящих чанков.
    *
@@ -223,6 +246,10 @@ export class FileTransferManager {
   }
 
   stop(): void {
+    // Ставится первым: циклы отправки должны увидеть флаг до того, как
+    // разорвутся каналы. Иначе проснувшийся насос отправит кадр в закрытый
+    // канал и сообщит об ошибке в момент штатного выхода из комнаты.
+    this.#stopped = true;
     for (const off of this.#unsubscribe) off();
     this.#unsubscribe.length = 0;
     for (const timer of this.#offerTimers.values()) clearTimeout(timer);
@@ -266,6 +293,7 @@ export class FileTransferManager {
 
     this.#failed.delete(transferId);
     this.#acked.delete(transferId);
+    this.#verified.set(transferId, new Set());
     this.#sending.set(transferId, {
       offer,
       source: params.source,
@@ -333,7 +361,12 @@ export class FileTransferManager {
       }
       case 'file-resume': {
         const job = this.#sending.get(msg.transferId);
-        if (job === undefined) return;
+        if (job === undefined) {
+          // Задачи нет только если файл уже подтвердили все, кто его принял:
+          // тогда докачка невозможна и просить её не о чем.
+          this.#trace(`докачка от ${short(peerId)} проигнорирована: передача ${short(msg.transferId)} уже закрыта`);
+          return;
+        }
         this.#accepted.get(msg.transferId)?.add(peerId);
         this.#clearOfferTimer(msg.transferId);
         this.#trace(`докачка ${short(msg.transferId)} от ${short(peerId)} с ${msg.offset}`);
@@ -356,6 +389,10 @@ export class FileTransferManager {
       case 'file-finish': {
         this.#opts.onLog?.(`передача ${msg.transferId.slice(0, 8)} подтверждена пиром ${peerId.slice(0, 8)}`);
         this.events.emit('verified', { transferId: msg.transferId, root: msg.root });
+        // Пир подтвердил, что файл у него целиком и контрольная сумма сошлась.
+        // Только теперь он больше не попросит докачку, и задачу можно убрать.
+        this.#verified.get(msg.transferId)?.add(peerId);
+        this.#dropIfFullyVerified(msg.transferId);
         return;
       }
       case 'file-offer': {
@@ -443,9 +480,9 @@ export class FileTransferManager {
           }
         }
         if (offset >= job.offer.size) break;
-        if (job.cancelled) return;
+        if (job.cancelled || this.#stopped) return;
         // 1. Окно по подтверждениям: ждём, пока получатель запишет уже отправленное.
-        while (offset - acked >= this.#windowBytes && !job.cancelled) {
+        while (offset - acked >= this.#windowBytes && !job.cancelled && !this.#stopped) {
           const buffer = this.#opts.mesh.fileBufferOf(peerId);
           stalls++;
           if (stalls === 1 || stalls % 10 === 0) {
@@ -464,10 +501,10 @@ export class FileTransferManager {
             return;
           }
         }
-        if (job.cancelled) return;
+        if (job.cancelled || this.#stopped) return;
 
         // 2. Место в буфере канала. Здесь и был главный источник зависания.
-        while (!this.#opts.mesh.hasFileCapacity(peerId) && !job.cancelled) {
+        while (!this.#opts.mesh.hasFileCapacity(peerId) && !job.cancelled && !this.#stopped) {
           const buffer = this.#opts.mesh.fileBufferOf(peerId);
           stalls++;
           if (stalls === 1 || stalls % 10 === 0) {
@@ -496,11 +533,15 @@ export class FileTransferManager {
             return;
           }
         }
-        if (job.cancelled) return;
+        if (job.cancelled || this.#stopped) return;
 
         // 3. Отправляем чанк.
         const end = Math.min(offset + chunkSize, job.offer.size);
         const data = await job.source.slice(offset, end);
+        // slice асинхронен (файл читается с диска), и за это время мог выйти из
+        // комнаты. Без проверки кадр ушёл бы в закрытый канал и породил ошибку
+        // «передача прервана» в момент штатного выхода.
+        if (this.#stopped || job.cancelled) return;
         await this.#opts.mesh.sendFileChunk(peerId, transferIdRaw, offset, data);
         offset = end;
 
@@ -525,6 +566,12 @@ export class FileTransferManager {
       }
     } catch (err) {
       job.pumping = false;
+      // Ошибка на закрытом канале после stop() — это не сбой передачи, а
+      // штатный выход из комнаты. Сообщать о нём незачем и вредно.
+      if (this.#stopped) {
+        this.#trace(`передача ${short(transferId)} → ${short(peerId)} прервана выходом из комнаты`);
+        return;
+      }
       this.#fail(transferId, `передача пиру ${short(peerId)} прервана: ${errText(err)}`);
       return;
     }
@@ -532,18 +579,37 @@ export class FileTransferManager {
     // Цикл завершён: снимаем флаг, чтобы запрос докачки после этого смог
     // запустить новый цикл с нуля.
     job.pumping = false;
-    if (job.resumeAt !== null || job.cancelled) return;
+    if (job.resumeAt !== null || job.cancelled || this.#stopped) return;
     if (offset < job.offer.size) return;
 
     this.#trace(`отправка ${short(transferId)} → ${short(peerId)} завершена: ${offset} Б, пауз ${stalls}`);
     this.#opts.mesh.sendCtrlTo(peerId, { k: 'file-finish', transferId, root: job.offer.root });
     this.events.emit('complete', { transferId, offer: job.offer, direction: 'out' });
-    // Передача считается завершённой, когда все согласившиеся пиры получили файл.
+    // Задачу убираем только когда все пиры ПОДТВЕРДИЛИ получение, а не когда
+    // согласились его принять: до этого они вправе попросить докачку.
+    this.#dropIfFullyVerified(transferId);
+  }
+
+  /**
+   * Убирает задачу, если файл подтвердили все, кто его принял.
+   *
+   * Условие — по пирам, принявшим файл, а не по всем готовым соединениям: пир,
+   * отклонивший книгу, докачку просить не станет, и ждать его подтверждения
+   * можно было бы вечно.
+   */
+  #dropIfFullyVerified(transferId: string): void {
+    const job = this.#sending.get(transferId);
+    if (job === undefined) return;
     const accepted = this.#accepted.get(transferId);
-    if (accepted !== undefined && accepted.size >= job.peers.size) {
-      this.#sending.delete(transferId);
-      this.#accepted.delete(transferId);
+    if (accepted === undefined || accepted.size === 0) return;
+    const verified = this.#verified.get(transferId);
+    if (verified === undefined) return;
+    for (const peerId of accepted) {
+      if (!verified.has(peerId)) return;
     }
+    this.#sending.delete(transferId);
+    this.#accepted.delete(transferId);
+    this.#verified.delete(transferId);
   }
 
   /**
@@ -644,6 +710,9 @@ export class FileTransferManager {
     if (chunk.offset !== job.expectedNext) {
       // Канал надёжный и упорядоченный, поэтому рассинхронизация означает
       // повреждённое состояние. Просим докачку с нужного места.
+      this.#trace(
+        `принят чанк с ${chunk.offset}, а ожидался ${job.expectedNext} из ${job.offer.size} — просим докачку`,
+      );
       this.#opts.mesh.sendCtrlTo(job.from, { k: 'file-resume', transferId: chunk.transferId, offset: job.expectedNext });
       return;
     }

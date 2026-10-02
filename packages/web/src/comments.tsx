@@ -7,7 +7,7 @@
  * Раскрыть можно вручную.
  */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { createTextAnchor, isSpoilerHidden, type CommentAnchor, type CommentSnapshot, type ParsedEpub } from '@rd/library';
 import type { RoomSession } from './room-session.js';
 import { useSession } from './use-session.js';
@@ -47,7 +47,9 @@ export function CommentsPanel({
   const [book, setBook] = useState<ParsedEpub | null>(null);
 
   const index = bookId === null ? null : session.bookIndex(bookId);
-  useMemo(() => {
+  // Именно useEffect, а не useMemo: здесь есть побочный эффект (асинхронный
+  // разбор книги и setBook), а useMemo React вправе вызвать и во время рендера.
+  useEffect(() => {
     if (bookId === null) {
       setBook(null);
       return;
@@ -59,10 +61,37 @@ export function CommentsPanel({
     };
   }, [bookId, session]);
 
-  const comments = state?.comments ?? [];
+  /**
+   * Комментарии ОТКРЫТОЙ книги.
+   *
+   * ─── Почему фильтр здесь, а не в сессии ──────────────────────────────────────
+   *
+   * Список в состоянии сессии — все комментарии комнаты, и раньше он считался
+   * для книги из позиции чтения, то есть для той, которую я читаю **сейчас**.
+   * Открытая в интерфейсе книга от этого не зависела, поэтому панель:
+   *   - показывала чужие комментарии, показывая чужую книгу;
+   *   - обновлялась только когда что-то менялось в документе — то есть когда
+   *     пользователь что-то дописывал. Отсюда «надо что-то написать, чтобы
+   *     комментарии подтянулись».
+   *
+   * Теперь `bookId` в зависимостях: переключение книги пересобирает список
+   * сразу, без ожидания правки в документе.
+   */
+  const comments = useMemo(
+    () => (state?.comments ?? []).filter((c) => c.bookId === bookId),
+    [bookId, state?.comments],
+  );
   const threads = useMemo(() => groupThreads(comments), [comments]);
   const progress = state?.position.progress ?? 0;
   const selfId = session.selfId;
+
+  // Черновик, ответ и раскрытые спойлеры принадлежат конкретной книге: оставленные
+  // при переключении они уехали бы в другую книгу — ответ в треде чужой книги
+  // это уже не опечатка, а чужое сообщение от вашего имени.
+  useEffect(() => {
+    setReplyTo(null);
+    setRevealed(new Set());
+  }, [bookId]);
 
   const submit = (parentId: string | null): void => {
     const text = draft.trim();

@@ -33,6 +33,7 @@ import {
   RoomMesh,
   WebSocketSignalTransport,
   YRoomProvider,
+  type IceServerConfig,
   type RtcFactory,
   type RoomPeerInfo,
   type SignalTransport,
@@ -51,6 +52,7 @@ import {
 } from '@rd/library';
 import { parseTextBook, textMime } from './parse-book.js';
 import { newId, PBKDF2_ITERATIONS, type PeerDescriptor, type RoomId } from '@rd/protocol';
+import { loadIceServers, type IceServersResult } from './ice-config.js';
 import { AudioPlayer } from './audio-player.js';
 import type { RemotePosition } from './audio-core.js';
 import { LocalFiles, transferFileName } from './local-files.js';
@@ -242,6 +244,14 @@ export interface SessionDeps {
   rtc?: RtcFactory;
   /** Итераций PBKDF2: в тестах 1000 вместо 600 тысяч. */
   kdfIterations?: number;
+  /**
+   * Готовая ICE-конфигурация вместо запроса к signaling-серверу.
+   *
+   * Тестам это нужно не только для удобства: без него каждый тест сессии
+   * ходил бы в сеть. Пустой массив — осмысленное значение («только локальные
+   * кандидаты»), и его нельзя спутать с «не задано».
+   */
+  iceServers?: IceServerConfig[];
 }
 
 export interface SessionOptions {
@@ -391,12 +401,42 @@ export class RoomSession {
         newPeerId: () => newId(),
       });
 
+    /**
+     * ICE-конфигурация: у signaling-сервера, а при неудаче — из настроек
+     * сборки. Запрос не блокирует вход надолго и не может уронить комнату:
+     * без STUN соединение устанавливается внутри одной сети, и это лучше, чем
+     * отказ входить. Подробности и разбор формата — в ice-config.ts.
+     */
+    const ice =
+      session.#deps.iceServers !== undefined
+        ? ({ iceServers: session.#deps.iceServers, source: 'deps' } satisfies IceServersResult)
+        : await loadIceServers({ signalingUrl: options.signalingUrl });
+    /**
+     * В журнал — только отклонение.
+     *
+     * Полезный вопрос при разборе «у соседа соединяется, а у меня нет» —
+     * «какой ICE применился на самом деле». Отвечать на него нужно при сбое, а
+     * не при каждом успехе: строка на каждую сессию превращается в шум, который
+     * скрывает всё остальное. Если сервер ответил или конфигурацию задал вызов
+     * (тест, встроенная сборка), всё штатно и молчание правильно.
+     */
+    if (ice.source === 'fallback' || ice.source === 'none') {
+      console.debug(
+        `[rd/ice] signaling не дал ICE-конфигурацию (${ice.reason ?? ice.source}); ` +
+          `работаем на ${ice.iceServers.length === 0 ? 'локальных кандидатах' : 'резервном списке'}`,
+      );
+    }
+
     const mesh = new RoomMesh({
       roomId: options.roomId,
       passKey,
       self: identity,
       transport,
       rtc: session.#deps.rtc ?? defaultRtcFactory,
+      // Раньше здесь стоял пустой rtcConfig, и ICE-серверы не доезжали до
+      // RTCPeerConnection вообще: `ICE_SERVERS` у оператора и `VITE_ICE_FALLBACK`
+      // в сборке были двумя настройками, которые никуда не вели.
+      rtcConfig: { iceServers: ice.iceServers },
       // Диагностика P2P-слоя: паузы передачи из-за backpressure, таймауты
       // подтверждений, состояние рукопожатия.
       onTrace: (message) => {

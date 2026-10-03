@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Сквозной тест настоящей RoomSession: две сессии в одной комнате, реальный
  * FileTransferManager, реальный Dexie поверх fake-indexeddb, настоящий Yjs.
  *
@@ -78,6 +78,7 @@ async function makeSessions(): Promise<Pair> {
         // 600 тысяч итераций PBKDF2 на каждый тест — минута ожидания вместо
         // десятков миллисекунд. Криптография проверена отдельно.
         kdfIterations: 1_000,
+        iceServers: [],
       },
     );
     cleanup.push(async () => {

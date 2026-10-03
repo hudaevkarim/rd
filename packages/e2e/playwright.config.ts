@@ -1,6 +1,8 @@
 import { defineConfig, devices } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 
+import { SIGNALING_HTTP, SIGNALING_WS, SIGNALING_PORT, WEB_PORT, WEB_URL } from './ports.js';
+
 /**
  * Сквозные UI-тесты: signaling + клиент + два браузерных контекста.
  *
@@ -16,12 +18,6 @@ import { fileURLToPath } from 'node:url';
  * запустил ли разработчик что-то руками, и не должны ломать его работающий сервер
  * разработки. Переопределяются переменными окружения.
  */
-
-const SIGNALING_PORT = Number(process.env.RD_E2E_SIGNALING_PORT ?? 8790);
-const WEB_PORT = Number(process.env.RD_E2E_WEB_PORT ?? 5199);
-const SIGNALING_HTTP = `http://127.0.0.1:${SIGNALING_PORT}`;
-const SIGNALING_WS = `ws://127.0.0.1:${SIGNALING_PORT}/ws`;
-const WEB_URL = `http://127.0.0.1:${WEB_PORT}`;
 
 /** Корень монорепо: команды npm workspaces запускаются только отсюда. */
 const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
@@ -119,13 +115,20 @@ export default defineConfig({
         /**
          * STUN выключен намеренно.
          *
-         * Сейчас клиент не запрашивает ICE-серверы вообще (см. замечание в
-         * README про `ICE_SERVERS`), и соединение строится на локальных
-         * кандидатах. Если бы кандидаты брались из окружения, внешний STUN стал
-         * бы сетевой зависимостью тестов: при отсутствии сети они падали бы
-         * по таймауту, и причина была бы неочевидна.
+         * Тесты не должны зависеть от внешней сети: иначе при её отсутствии они
+         * падали бы по таймауту, и причина была бы неочевидна. Пустой список на
+         * сервере выбран ещё и потому, что так проверяется ветка «сервер ответил,
+         * но ICE не дал» — самая частая в жизни.
          */
         ICE_SERVERS: '',
+        /**
+         * CORS разрешён для клиента.
+         *
+         * Именно он нужен, чтобы `GET /config` вообще прошёл: клиент живёт на
+         * другом порту, а это для браузера другой источник. Без этого тесты
+         * проверяли бы не код, а отказ браузера.
+         */
+        CORS_ORIGIN: WEB_URL,
       },
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
@@ -146,7 +149,16 @@ export default defineConfig({
       command: `npm run dev --workspace @rd/web -- --port ${WEB_PORT} --strictPort --host 127.0.0.1`,
       cwd: REPO_ROOT,
       url: WEB_URL,
-      env: { VITE_SIGNALING_URL: SIGNALING_WS },
+      env: {
+        VITE_SIGNALING_URL: SIGNALING_WS,
+        /**
+         * Резервный ICE-сервер выключен: см. выше. Пустое значение означает
+         * «не обращаться ни к одному внешнему сервису» — ровно то поведение,
+         * которым обладало приложение до этой настройки, так что e2e проверяет
+         * прежний, самый строгий режим.
+         */
+        VITE_ICE_FALLBACK: '',
+      },
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
       stdout: 'ignore',

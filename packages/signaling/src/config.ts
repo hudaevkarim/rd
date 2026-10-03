@@ -30,7 +30,13 @@ export interface ServerConfig {
   /** Порог отложенной отправки, после которого соединение рвётся (байт). */
   maxBufferedBytes: number;
   roomIdleEvictMs: number;
-  /** Разрешённые источники для CORS. Пустая строка — CORS выключен. */
+  /**
+   * Разрешённые источники для CORS.
+   *
+   * `*` — любой источник. Ограничивать нечего: WebSocket-эндпоинт всё равно
+   * открыт любому сайту, а `/config` без CORS недоступен клиенту с другого
+   * домена, и тот молча остался бы без STUN.
+   */
   corsOrigin: string;
   logLevel: string;
   /** ICE-серверы, которые клиенту понадобятся для NAT-траверса. */
@@ -53,6 +59,21 @@ function str(name: string, fallback: string): string {
 }
 
 /**
+ * Значение переменной как есть, включая пустое.
+ *
+ * Отдельный метод нужен там, где пустая строка — осмысленное значение, а не
+ * «не задано». Для `ICE_SERVERS` это ровно такой случай: оператор хочет, чтобы
+ * клиент вообще не обращался к внешним серверам. Через `str` такой запрос
+ * невозможен — пустое значение молча превращалось в умолчание, и ветка
+ * «пусто → пустой список» была недостижимой. То есть задокументированный в
+ * `.env.example` способ отключить ICE не работал.
+ */
+function rawStr(name: string, fallback: string): string {
+  const value = process.env[name];
+  return value === undefined ? fallback : value;
+}
+
+/**
  * ICE-серверы. По умолчанию — только публичный STUN от Cloudflare.
  *
  * TURN здесь НЕ прописан намеренно: TURN — это сервер, который видит ваш
@@ -65,7 +86,7 @@ function str(name: string, fallback: string): string {
  * (`stun:a,turn:b`), валила бы сервер на старте.
  */
 function iceServers(): ServerConfig['iceServers'] {
-  const raw = str('ICE_SERVERS', 'stun:stun.cloudflare.com:3478').trim();
+  const raw = rawStr('ICE_SERVERS', 'stun:stun.cloudflare.com:3478').trim();
   if (raw === '') return [];
   if (raw.startsWith('[')) {
     try {
@@ -94,7 +115,7 @@ export function loadConfig(): ServerConfig {
     connectBurst: num('CONNECT_BURST', DEFAULT_CONNECT_PER_MIN, 1, 10_000),
     maxBufferedBytes: num('MAX_BUFFERED_BYTES', 512 * 1024, 4096, 16 * 1024 * 1024),
     roomIdleEvictMs: num('ROOM_IDLE_EVICT_MS', ROOM_IDLE_EVICT_MS, 0, 3_600_000),
-    corsOrigin: str('CORS_ORIGIN', ''),
+    corsOrigin: str('CORS_ORIGIN', '*'),
     logLevel: str('LOG_LEVEL', 'info'),
     iceServers: iceServers(),
   };

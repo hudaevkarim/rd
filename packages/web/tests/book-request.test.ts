@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Передача книги только по запросу.
  *
  * ─── Что ловится ──────────────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ async function makeSessions(): Promise<Pair> {
     const session = await RoomSession.create(
       { roomId, passphrase, name, color, signalingUrl: 'ws://неиспользуется.invalid' },
       () => {},
-      { store, transport: (d) => new MemorySignalTransport(d, signalRoom), rtc: network.factory, kdfIterations: 1_000 },
+      { store, transport: (d) => new MemorySignalTransport(d, signalRoom), rtc: network.factory, kdfIterations: 1_000, iceServers: [] },
     );
     cleanup.push(async () => {
       await session.stop();

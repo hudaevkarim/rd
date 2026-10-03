@@ -93,9 +93,20 @@ export async function createSignalingServer(opts: SignalingOptions): Promise<Sig
   const startedAt = Date.now();
 
   await app.register(helmet, { contentSecurityPolicy: false });
-  if (config.corsOrigin !== '') {
-    await app.register(cors, { origin: config.corsOrigin === '*' ? true : config.corsOrigin.split(',') });
-  }
+  /**
+   * CORS по умолчанию разрешён для любого источника.
+   *
+   * Это не ослабление защиты, а её отсутствие: WebSocket-эндпоинт `/ws` и так
+   * доступен с любого сайта — браузер не применяет CORS к WebSocket, и
+   * ограничивать его origin'ом сервер не может. Значит, запрет CORS на `/config`
+   * не закрывал ничего, а только ломал: клиент, загруженный не с того же
+   * origin (а это обычная раскладка — отдельный домен под клиент и отдельный под
+   * signaling), не мог спросить ICE-конфигурацию и молча работал без STUN.
+   *
+   * Тем не менее ограничение полезно: сервер перестаёт быть точкой притяжения
+   * для чужих сайтов. Задайте `CORS_ORIGIN` — и он будет.
+   */
+  await app.register(cors, { origin: config.corsOrigin === '*' ? true : config.corsOrigin.split(',') });
   await app.register(websocket, {
     options: {
       maxPayload: MAX_SIGNAL_MESSAGE_BYTES,

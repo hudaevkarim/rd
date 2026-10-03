@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 import { newId, PROTOCOL_VERSION, AGREE_KEY_BYTES, IDENTITY_KEY_BYTES, type PeerDescriptor, type ServerMessage } from '@rd/protocol';
 import { createSignalingServer, type SignalingServer } from '../src/index.js';
-import type { ServerConfig } from '../src/config.js';
+import { loadConfig, type ServerConfig } from '../src/config.js';
 
 const config: ServerConfig = {
   host: '127.0.0.1',
@@ -122,6 +122,102 @@ describe('healthz и конфигурация', () => {
     const cfg = await server.app.inject({ method: 'GET', url: '/config' });
     expect(cfg.statusCode).toBe(200);
     expect(cfg.json()).toMatchObject({ protocol: PROTOCOL_VERSION, maxRoomPeers: 3 });
+  });
+
+  it('отдаёт ICE-серверы, которые задал оператор', async () => {
+    const { server } = await startServer({
+      iceServers: [{ urls: 'turn:turn.example:3478', username: 'u', credential: 'p' }],
+    });
+    const cfg = await server.app.inject({ method: 'GET', url: '/config' });
+    // Форма должна совпадать с тем, что ждёт клиент: иначе он отбросит
+    // конфигурацию и молча уйдёт на резервный список.
+    expect(cfg.json()).toMatchObject({
+      iceServers: [{ urls: 'turn:turn.example:3478', username: 'u', credential: 'p' }],
+    });
+  });
+
+  it('разрешает чтение конфигурации с другого источника', async () => {
+    // Без этого заголовка клиент с другого домена (а это обычная раскладка:
+    // отдельный домен под клиент и отдельный под signaling) не увидит ICE-конфигурацию
+    // и останется на локальных кандидатах — молча, без ошибки.
+    const { server } = await startServer({ corsOrigin: 'http://client.example' });
+    const cfg = await server.app.inject({
+      method: 'GET',
+      url: '/config',
+      headers: { origin: 'http://client.example' },
+    });
+    expect(cfg.headers['access-control-allow-origin']).toBe('http://client.example');
+
+    // Чужой источник заголовка не получает.
+    const other = await server.app.inject({
+      method: 'GET',
+      url: '/config',
+      headers: { origin: 'http://чужик.example' },
+    });
+    expect(other.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
+  it('по умолчанию разрешает любой источник', async () => {
+    // WebSocket-эндпоинт всё равно открыт любому сайту, поэтому CORS-заголовок по
+    // умолчанию должен быть: иначе он запрещал бы чтение /config, но не защищал бы
+    // ничего. Явно заданный список, наоборот, ограничивает.
+    const { server } = await startServer({ corsOrigin: '*' });
+    const cfg = await server.app.inject({
+      method: 'GET',
+      url: '/config',
+      headers: { origin: 'http://any.example' },
+    });
+    expect(cfg.headers['access-control-allow-origin']).toBeTruthy();
+  });
+});
+
+describe('чтение переменных окружения', () => {
+  /** Подменяет переменные на время вызова и возвращает результат. */
+  async function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T): Promise<T> {
+    const saved = new Map<string, string | undefined>();
+    for (const [key, value] of Object.entries(vars)) {
+      saved.set(key, process.env[key]);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    try {
+      return await fn();
+    } finally {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  }
+
+  it('пустой ICE_SERVERS отключает внешние серверы', async () => {
+    // Раньше `str()` превращала пустое значение в «не задано», и проверка
+    // `raw === ''` ниже была недостижимой: документированный способ отключить
+    // ICE не работал. Теперь пустая строка — осмысленное значение.
+    const result = await withEnv({ ICE_SERVERS: '' }, () => loadConfig());
+    expect(result.iceServers).toEqual([]);
+  });
+
+  it('по умолчанию берётся публичный STUN', async () => {
+    const result = await withEnv({ ICE_SERVERS: undefined }, () => loadConfig());
+    expect(result.iceServers.length).toBeGreaterThan(0);
+    expect(String(result.iceServers[0]?.urls)).toContain('stun:');
+  });
+
+  it('разбирает список через запятую', async () => {
+    const result = await withEnv({ ICE_SERVERS: 'stun:a.example, stun:b.example' }, () => loadConfig());
+    expect(result.iceServers).toEqual([{ urls: 'stun:a.example' }, { urls: 'stun:b.example' }]);
+  });
+
+  it('принимает JSON с учётными данными', async () => {
+    const json = JSON.stringify([{ urls: 'turn:t.example', username: 'u', credential: 'p' }]);
+    const result = await withEnv({ ICE_SERVERS: json }, () => loadConfig());
+    expect(result.iceServers[0]).toMatchObject({ username: 'u', credential: 'p' });
+  });
+
+  it('CORS по умолчанию открыт для любого источника', async () => {
+    const result = await withEnv({ CORS_ORIGIN: undefined }, () => loadConfig());
+    expect(result.corsOrigin).toBe('*');
   });
 });
 

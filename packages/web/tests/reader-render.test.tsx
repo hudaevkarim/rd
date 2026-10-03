@@ -1,4 +1,4 @@
-// @vitest-environment jsdom
+﻿// @vitest-environment jsdom
 /**
  * Регрессия на пустую страницу при смене книги.
  *
@@ -199,7 +199,7 @@ async function makeSession(): Promise<RoomSession> {
       signalingUrl: 'ws://неиспользуется.invalid',
     },
     () => {},
-    { store, transport: (d) => new MemorySignalTransport(d, signalRoom), rtc: network.factory, kdfIterations: 1_000 },
+    { store, transport: (d) => new MemorySignalTransport(d, signalRoom), rtc: network.factory, kdfIterations: 1_000, iceServers: [] },
   );
   cleanup.push(async () => {
     await session.stop();

@@ -1,4 +1,4 @@
-// @vitest-environment jsdom
+﻿// @vitest-environment jsdom
 /**
  * Аудиокнига открывается на том месте, где её остановили.
  *
@@ -86,7 +86,7 @@ async function makeSession(): Promise<RoomSession> {
       signalingUrl: 'ws://неиспользуется.invalid',
     },
     () => {},
-    { store, transport: (d) => new MemorySignalTransport(d, signalRoom), rtc: network.factory, kdfIterations: 1_000 },
+    { store, transport: (d) => new MemorySignalTransport(d, signalRoom), rtc: network.factory, kdfIterations: 1_000, iceServers: [] },
   );
   cleanup.push(async () => {
     await session.stop();
@@ -140,7 +140,7 @@ async function makeTwoSessions(): Promise<{ anna: RoomSession; boris: RoomSessio
     const session = await RoomSession.create(
       { roomId, passphrase: 'север-берег-звезда-улица', name, color, signalingUrl: 'ws://неиспользуется.invalid' },
       () => {},
-      { store, transport: (d) => new MemorySignalTransport(d, signalRoom), rtc: network.factory, kdfIterations: 1_000 },
+      { store, transport: (d) => new MemorySignalTransport(d, signalRoom), rtc: network.factory, kdfIterations: 1_000, iceServers: [] },
     );
     cleanup.push(async () => {
       await session.stop();

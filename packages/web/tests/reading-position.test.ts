@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Личное место чтения по книгам: запоминается, переживает перезагрузку и не
  * путается между книгами.
  *
@@ -54,6 +54,7 @@ async function makeSession(roomId: string, dbName: string, store = createLibrary
       transport: (descriptor) => new MemorySignalTransport(descriptor, signalRoom),
       rtc: network.factory,
       kdfIterations: 1_000,
+      iceServers: [],
     },
   );
   cleanup.push(async () => {
@@ -245,7 +246,7 @@ describe('личное место чтения', () => {
         signalingUrl: 'ws://неиспользуется.invalid',
       },
       () => {},
-      { store, transport: (d) => new MemorySignalTransport(d, signalRoom), rtc: network.factory, kdfIterations: 1_000 },
+      { store, transport: (d) => new MemorySignalTransport(d, signalRoom), rtc: network.factory, kdfIterations: 1_000, iceServers: [] },
     );
     cleanup.push(async () => {
       await session.stop();

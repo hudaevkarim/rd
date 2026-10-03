@@ -239,19 +239,66 @@ describe('топология комнаты', () => {
       () => room.sessions.every((s) => s.state.peers.length === 7 && s.state.peers.every((p) => p.state === 'ready')),
       'mesh поднялся',
     );
-    // Запоминаем состав соседей: после перехода в star он обязан остаться тем же.
-    const [first, second] = room.sessions;
-    const peersBefore = first?.state.peers.map((p) => p.id).sort().join(',') ?? '';
+    const first = room.sessions[0];
+    const peersBefore = first?.state.peers.map((p) => p.id) ?? [];
 
     await room.add();
     await awaitStar(room.sessions);
 
-    // Ни одно соединение mesh не рвалось и не пересоздалось: те же соседи, те же
-    // состояния. Обрыв здесь означал бы потерю позиции чтения и незавершённую
-    // передачу файла — переход обязан быть незаметным для открытой книги.
-    expect(first?.state.peers.map((p) => p.id).sort().join(',')).toBe(peersBefore);
-    expect(first?.state.peers.every((p) => p.state === 'ready')).toBe(true);
-    expect(second?.state.peers.every((p) => p.state === 'ready')).toBe(true);
+    // Инвариант: каждое УЖЕ БЫВШЕЕ соединение осталось живым.
+    //
+    // Первая версия проверяла, что СПИСОК пиров не изменился, и падала то
+    // случайно, то нет. Причина — не код, а подмена понятий: список пиров у
+    // участника это состав КОМНАТЫ, а не список соединений. Девятый участник
+    // закономерно появляется у всех, даже тех, кто с ним не соединён и не
+    // должен быть соединён в star. Проверять состав тут нечего.
+    const peersAfter = first?.state.peers.map((p) => p.id) ?? [];
+    for (const id of peersBefore) expect(peersAfter).toContain(id);
+
+    // Рвать установленные соединения нельзя: на них может висеть позиция
+    // чтения и незаконченная передача файла. Переход обязан быть незаметным.
+    const stateAfter = new Map(first?.state.peers.map((p) => [p.id, p.state]) ?? []);
+    for (const id of peersBefore) {
+      expect(stateAfter.get(id), `соединение с ${id} не сохранилось`).toBe('ready');
+    }
+  }, TIMEOUT);
+
+  it('после перевыборов новый relay соединён со всеми листьями', async () => {
+    // Регрессия: раньше решение о топологии читалось только при приходе и
+    // уходе участника, но не при САМОМ решении. При перевыборах новых
+    // участников нет и никто не протягивает руку первым, поэтому соединения с
+    // новым relay не появлялись: часть листьев навсегда оставалась без связи,
+    // и перевыборы были объявлены, но комната оставалась разрезанной.
+    const room = await makeRoom();
+    for (let i = 0; i < 12; i++) await room.add();
+    const firstRelay = await awaitStar(room.sessions);
+
+    const index = room.sessions.findIndex((s) => s.selfId === firstRelay);
+    expect(index).toBeGreaterThanOrEqual(0);
+    await room.leave(index);
+
+    await waitFor(
+      () => room.sessions.every((s) => s.mesh.relayDecision.relayId !== null && s.mesh.relayDecision.relayId !== firstRelay),
+      'relay перевыбран',
+    );
+    const newRelay = [...new Set(room.sessions.map((s) => s.mesh.relayDecision.relayId))][0] as PeerId;
+
+    // Ждём именно соединений, а не только смены идентификатора: смена решения
+    // происходит мгновенно, а рукопожатие занимает время.
+    await waitFor(
+      () =>
+        room.sessions.every((s) =>
+          s.selfId === newRelay
+            ? s.state.peers.length === room.sessions.length - 1
+            : s.state.peers.find((p) => p.id === newRelay)?.state === 'ready',
+        ),
+      'новый relay соединился со всеми листьями',
+    );
+
+    const leafStates = room.sessions
+      .filter((s) => s.selfId !== newRelay)
+      .map((s) => s.state.peers.find((p) => p.id === newRelay)?.state);
+    expect(leafStates.every((st) => st === 'ready')).toBe(true);
   }, TIMEOUT);
 
   it('уход участника обратно в mesh возвращает прямое соединение листьев', async () => {

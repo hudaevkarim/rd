@@ -162,7 +162,13 @@ async function waitFor(pred: () => boolean, what: string, timeoutMs = 30_000): P
   for (;;) {
     if (pred()) return;
     if (Date.now() - start > timeoutMs) throw new Error(`не дождались: ${what}`);
-    await new Promise((r) => setTimeout(r, 10));
+    // Ожидание идёт ВНУТРИ act: пока ждём, сессия успевает прислать обновления
+    // состояния (позиция, присутствие, каталог), и без act React считает их
+    // обновлениями вне теста и ругается в журнал. Побочный эффект полезный:
+    // act заодно дожидается перерисовки, так что после waitFor дом уже готов.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 10));
+    });
   }
 }
 
@@ -305,7 +311,12 @@ describe('аудиокнига: возврат на сохранённое ме�
     act(() => {
       session.audio.seek(515);
     });
-    await session.stop();
+    // Выход из комнаты меняет состояние сессии, на которое подписан плеер,
+    // поэтому его тоже выполняем внутри act — иначе React ругается на
+    // обновление вне теста.
+    await act(async () => {
+      await session.stop();
+    });
 
     expect(session.positionOf(bookId)?.audioSec).toBe(515);
   });

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * RoomMesh — полносвязная (mesh) сеть пиров комнаты.
  *
  * Топология: каждый связан с каждым напрямую, без ретрансляции. Для MVP с
@@ -131,6 +131,15 @@ export class RoomMesh {
    * дал бы неверный выбор relay.
    */
   readonly #relay: RoomRelay;
+  /** Отписка от решений о топологии; вызывается при остановке. */
+  #relayUnsubscribe: (() => void) | null = null;
+  /**
+   * Идёт обработка сообщения о приходе участника.
+   *
+   * Нужно, чтобы в этот момент не протягивать руку первым: первым её
+   * протягивает вошедший, и два offer'а подряд — лишний glare на ровном месте.
+   */
+  #incomingJoin = false;
 
   #selfId: PeerId | null = null;
   #pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -160,6 +169,34 @@ export class RoomMesh {
         ? 'relayEnabled: star-топология разрешена, пересылка трафика пока не реализована'
         : 'relayEnabled: false, комната всегда mesh',
     );
+    // Решение о топологии меняет требуемые соединения, значит обработчик должен
+    // реагировать на САМО РЕШЕНИЕ, а не только на приход и уход участников.
+    this.#relayUnsubscribe = this.#relay.onChange(() => this.#connectAccordingToTopology());
+  }
+
+  /**
+   * Создать соединения, которых требует текущая топология.
+   *
+   * Нужна не только при входе. Пример: relay вышел, прошли перевыборы, новым
+   * relay стал кто-то из листьев — и соединения с ним не появились бы сами,
+   * потому что ново��очек в комнате нет и никто не предложил руку. Раньше это
+   * означало бы, что перевыборы объявляются, но комната остаётся разрезанной.
+   *
+   * Предлагает руку только тем, с кем соединения ещё нет: повторный offer поверх
+   * рукопожатия сорвал бы perfect negotiation, а лишние сигналы идут в сеть.
+   */
+  #connectAccordingToTopology(): void {
+    // Пока сообщение о приходе обрабатывается, предлагать нельзя: руку первым
+    // протягивает вошедший, и оба offer'а сразу дают ненужный glare.
+    // Пропустить соединение тут невозможно: вошедший предлагает всем, с кем сам
+    // считает нужным соединиться, и до нас дойдёт его offer.
+    if (this.#incomingJoin) return;
+    if (this.#selfId === null) return;
+    for (const id of this.#peers.keys()) {
+      if (!this.#shouldConnect(id)) continue;
+      if (this.#peers.get(id)?.link !== null) continue;
+      this.#ensureLink(id)?.startAsOfferer().catch(() => {});
+    }
   }
 
   /**
@@ -333,6 +370,10 @@ export class RoomMesh {
     this.#stopPing();
     for (const off of this.#unsubscribe) off();
     this.#unsubscribe = [];
+    // Отписка от решений о топологии: остановленная сессия не должна ни
+    // создавать соединения, ни держать подписку в памяти вызывающего кода.
+    this.#relayUnsubscribe?.();
+    this.#relayUnsubscribe = null;
     for (const rec of this.#peers.values()) rec.link?.close();
     this.#peers.clear();
     this.#queue.clear();
@@ -364,10 +405,16 @@ export class RoomMesh {
       }
       case 'peer-joined': {
         this.#upsert(msg.peer);
-        this.#refreshTopology();
-        if (!this.#shouldConnect(msg.peer.id)) return;
-        // Существующий пир: только отвечаем на offer, свои каналы не создаём.
-        this.#ensureLink(msg.peer.id);
+        this.#incomingJoin = true;
+        try {
+          this.#refreshTopology();
+          if (this.#shouldConnect(msg.peer.id)) {
+            // Вошедший первым протягивает руку, мы только готовимся её принять.
+            this.#ensureLink(msg.peer.id);
+          }
+        } finally {
+          this.#incomingJoin = false;
+        }
         this.#emitPeers();
         return;
       }

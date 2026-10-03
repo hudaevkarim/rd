@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Signaling-сервер.
  *
  * Роль: помочь двум браузерам обменяться SDP и ICE-кандидатами, после чего
@@ -20,7 +20,7 @@
  *     типы сообщений и коды ошибок.
  */
 
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { LogController, type FastifyInstance } from 'fastify';
 import websocket from '@fastify/websocket';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
@@ -97,8 +97,12 @@ export async function createSignalingServer(opts: SignalingOptions): Promise<Sig
      * Ошибки и нештатные завершения остаются видны: их пишет обработчик ошибок
      * Fastify, а не журнал запросов. Старт, остановка и параметры сервера
      * печатаются явно в main.ts.
+     *
+     * Передаётся именно `logController`, а не опция `disableRequestLogging`:
+     * последняя объявлена устаревшей и должна исчезнуть в fastify@6, где
+     * сервер перестал бы запускаться вовсе. Поведение то же.
      */
-    disableRequestLogging: true,
+    logController: new LogController({ disableRequestLogging: true }),
     // Сервер не принимает тела запросов — ограничиваем на всякий случай.
     bodyLimit: 16 * 1024,
     trustProxy: true,

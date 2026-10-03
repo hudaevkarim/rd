@@ -378,6 +378,9 @@ const SKIP_TAGS = new Set([
 /** Теги, содержимое которых имеет смысл отдать рендереру как инлайновое. */
 export const INLINE_TAGS = new Set([
   'em', 'strong', 'i', 'b', 'u', 'small', 's', 'sub', 'sup', 'code', 'span', 'a', 'br', 'mark',
+  // FB2: курсив, зачёркивание и цитата. Без них акцидентный текст FB2 терял бы
+  // оформление при разборе.
+  'emphasis', 'strikethrough', 'cite',
 ]);
 
 /** Теги, из которых получается абзац/заголовок. */
@@ -385,6 +388,57 @@ const LEAF_BLOCK_TAGS = new Set([
   'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'blockquote', 'pre', 'figcaption',
   'dd', 'dt', 'caption', 'li', 'td', 'th',
 ]);
+
+export interface BlockExtractionOptions {
+  /**
+   * Теги, содержимое которых не является книжным текстом.
+   *
+   * Вынесено в параметр из-за FB2: там `<title>` — это заголовок главы, а не
+   * `<title>` из `<head>`, и пропуск его молча выкинул бы все заголовки книги.
+   */
+  skipTags?: ReadonlySet<string>;
+  /**
+   * Картинки: из них берётся подпись. В EPUB это `<img>`, в FB2 — `<image>` с
+   * ссылкой на `<binary>`.
+   */
+  imageTags?: ReadonlySet<string>;
+}
+
+const DEFAULT_SKIP_TAGS: ReadonlySet<string> = SKIP_TAGS;
+const DEFAULT_IMAGE_TAGS: ReadonlySet<string> = new Set(['img', 'image']);
+
+/**
+ * Атрибуты, которые вообще могут попасть в дерево блока.
+ *
+ * Именно белый список, а не «убрать опасное». Разница принципиальная: при
+ * блоклисте всё, чего автор блоклиста не знал, проходит насквозь — сюда попадают
+ * `onclick`, `onload`, `style`, `srcset`, `formaction` и любые новые атрибуты,
+ * которые придумают в следующей версии HTML. Здесь перечислено ровно то, что
+ * нужно рендереру, и всё остальное отбрасывается по построению.
+ *
+ * Практически это значит:
+ *   - `href` у `<a>` — иначе в книге не работают ссылки и внутренние переходы;
+ *   - `alt` у картинок — иначе иллюстрация в FB2 не показывает подпись.
+ *
+ * Раньше здесь был `attrs: {}` для всех элементов, из-за чего ветка рендерера
+ * для `<a href>` и `<img alt>` была недостижимой: атрибуты терялись на разборе,
+ * и ссылка в книге выглядела как обычный текст.
+ */
+const ALLOWED_ATTRS: Record<string, ReadonlySet<string>> = {
+  a: new Set(['href']),
+  img: new Set(['alt', 'title']),
+  image: new Set(['alt', 'title']),
+};
+
+function allowedAttrs(name: string, attrs: Record<string, string>): Record<string, string> {
+  const allowed = ALLOWED_ATTRS[name];
+  if (allowed === undefined) return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(attrs)) {
+    if (allowed.has(key)) out[key] = value;
+  }
+  return out;
+}
 
 /**
  * Нормализует инлайновое содержимое блока так, чтобы СКЛЕЕННЫЙ ТЕКСТ дерева
@@ -424,10 +478,26 @@ export function normalizeInline(node: XmlNode): XmlNode {
       children[i] = { ...cur, text: cur.text.replace(/^ +/, '') };
     }
   }
-  return { name: node.name, attrs: {}, children };
+  return { name: node.name, attrs: allowedAttrs(node.name, node.attrs), children };
 }
 
-export function extractBlocks(nodes: XmlNode[]): EpubBlock[] {
+/**
+ * Блоки из содержимого ОДНОГО элемента.
+ *
+ * Отдельный метод, потому что `extractBlocks` обходит потомков переданных узлов,
+ * а не их сами: на верхнем уровне ему отдают корень документа. Передать ему
+ * `<p>` напрямую — значит обойти его содержимое и потерять сам абзац: инлайн
+ * схлопнется в один блок, заголовок станет обычным текстом, а `<image>` внутри
+ * абзаца исчезнет совсем.
+ */
+export function extractBlocksOf(element: XmlNode, opts: BlockExtractionOptions = {}): EpubBlock[] {
+  const wrapper: XmlElement = { name: '#fragment', attrs: {}, children: [element] };
+  return extractBlocks([wrapper], opts);
+}
+
+export function extractBlocks(nodes: XmlNode[], opts: BlockExtractionOptions = {}): EpubBlock[] {
+  const skipTags = opts.skipTags ?? DEFAULT_SKIP_TAGS;
+  const imageTags = opts.imageTags ?? DEFAULT_IMAGE_TAGS;
   const blocks: EpubBlock[] = [];
   let pending = '';
 
@@ -457,14 +527,14 @@ export function extractBlocks(nodes: XmlNode[]): EpubBlock[] {
         pending += ' ';
         continue;
       }
-      if (SKIP_TAGS.has(child.name)) continue;
+      if (skipTags.has(child.name)) continue;
       if (child.name === 'hr') {
         flush();
         blocks.push({ index: blocks.length, kind: 'hr', node: { name: 'hr', attrs: {}, children: [] }, text: '' });
         continue;
       }
-      if (child.name === 'img' || child.name === 'image') {
-        // Изображения: подпись в EPUB обычно идёт рядом, само изображение
+      if (imageTags.has(child.name)) {
+        // Изображения: подпись в книге обычно идёт рядом, само изображение
         // пропускаем. В MVP поддержка иллюстраций — отдельная задача.
         continue;
       }

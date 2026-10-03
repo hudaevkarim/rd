@@ -42,7 +42,6 @@ import {
   blobSource,
   BookIndex,
   createLibraryStore,
-  parseEpub,
   RoomDoc,
   type BookEntry,
   type CommentAnchor,
@@ -50,6 +49,7 @@ import {
   type ParsedEpub,
   type StoredBook,
 } from '@rd/library';
+import { parseTextBook, textMime } from './parse-book.js';
 import { newId, PBKDF2_ITERATIONS, type PeerDescriptor, type RoomId } from '@rd/protocol';
 import { AudioPlayer } from './audio-player.js';
 import type { RemotePosition } from './audio-core.js';
@@ -778,7 +778,11 @@ export class RoomSession {
     const isAudio = looksLikeAudio(file.type, file.name);
     if (isAudio) return this.#importAudio(file, bytes);
 
-    const parsed = parseEpub(bytes);
+    // Формат определяем по содержимому, а не по расширению: браузер для .fb2
+    // обычно присылает пустой MIME, а переименованный файл вводит в
+    // заблуждение и по расширению.
+    const { book: parsed, format } = parseTextBook(bytes);
+    const mime = textMime(format, file.type);
     const id = newId();
 
     await this.#store.putBook({
@@ -786,9 +790,9 @@ export class RoomSession {
       roomId: this.roomId,
       title: parsed.title,
       author: parsed.author,
-      format: 'epub',
+      format,
       size: file.size,
-      mime: file.type === '' ? 'application/epub+zip' : file.type,
+      mime,
       root: '',
       blob: new Blob([bytes.slice().buffer as ArrayBuffer]),
       received: file.size,
@@ -804,9 +808,9 @@ export class RoomSession {
       id,
       title: parsed.title,
       author: parsed.author,
-      format: 'epub',
+      format,
       size: file.size,
-      mime: file.type === '' ? 'application/epub+zip' : file.type,
+      mime,
       root: '',
       addedBy: this.selfId === '' ? 'me' : this.selfId,
       durationSec: null,
@@ -1069,7 +1073,13 @@ export class RoomSession {
     if (cached !== undefined) return cached;
     const stored = await this.#store.getBook(this.roomId, bookId);
     if (stored?.blob == null) return null;
-    const parsed = parseEpub(new Uint8Array(await stored.blob.arrayBuffer()));
+    // Формат берём и из хранилища, и проверяем по содержимому: книга могла
+    // прийти от соседа под чужим именем, и тогда только содержимое скажет, что
+    // это FB2 (см. parse-book.ts).
+    const { book: parsed } = parseTextBook(
+      new Uint8Array(await stored.blob.arrayBuffer()),
+      stored.format === 'fb2' ? 'fb2' : stored.format === 'epub' ? 'epub' : undefined,
+    );
     this.#parsed.set(bookId, parsed);
     this.#markLocal(bookId);
     this.#indexes.set(bookId, new BookIndex(parsed));

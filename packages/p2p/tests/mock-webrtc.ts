@@ -498,3 +498,5 @@ export class MockRtcNetwork {
 }
 
 export { MockDataChannel, MockPeerConnection };
+
+export type { SessionDescriptionType };

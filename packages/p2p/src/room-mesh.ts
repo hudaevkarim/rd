@@ -24,6 +24,7 @@ import { PeerLink, type CtrlPayload, type LinkState, type SignalOut } from './pe
 import type { CapacityWait } from './channel-sender.js';
 import type { SignalTransport } from './signal-transport.js';
 import type { RtcConfig, RtcFactory } from './transport.js';
+import { DEFAULT_MESH_LIMIT, RoomRelay, shouldConnect, type RelayDecision, type RelayMember } from './relay.js';
 
 export interface RoomPeerInfo {
   id: PeerId;
@@ -60,6 +61,32 @@ export interface RoomMeshOptions {
   pingIntervalMs?: number;
   /** Сколько неотвеченных пингов допускаем на пира, прежде чем перестать мерить. */
   maxPendingPings?: number;
+  /**
+   * До какого числа участников держим mesh.
+   *
+   * За пределами порога включается star-топология с relay: см. `RoomRelay`.
+   * Значение `0` отключает relay полностью — полезно, чтобы оставить прежнее
+   * поведение и сравнивать с ним.
+   */
+  meshLimit?: number;
+  /**
+   * Разрешить переключение в star-топологию.
+   *
+   * По умолчанию ВЫКЛЮЧЕНО, и это не формальность. Выбор relay, перевыборы и
+   * построение соединений по star реализованы, а вот пересылка трафика через
+   * relay — ещё нет: в star лист соединён только с relay, и без пересылки
+   * сообщения от других листьев он просто не получит. Молча пропадающие данные
+   * опаснее явной ошибки, поэтому включается только осознанно.
+   *
+   * Строка `relayEnabled` попадает в трассировку, чтобы включение нельзя было
+   * пропустить, разглядывая список пиров: там такой участник выглядит обычным.
+   *
+   * Про настройки сервера: signaling по умолчанию не пускает в комнату больше
+   * `MAX_ROOM_PEERS` (8) участников, а star включается только СВЕРХ порога, так
+   * что на сервере с настройками по умолчанию это состояние недостижимо.
+   * Расширять `MAX_ROOM_PEERS`, не дописав пересылку, нельзя.
+   */
+  relay?: boolean;
   /** Подробный журнал P2P-слоя: backpressure, рукопожатие, передача файлов. */
   onTrace?(message: string): void;
 }
@@ -96,6 +123,14 @@ export class RoomMesh {
   readonly #peers = new Map<PeerId, PeerRecord>();
   readonly #queue = new Map<PeerId, QueuedSignal[]>();
   #unsubscribe: Array<() => void> = [];
+  /**
+   * Кто в комнате и какая сейчас топология.
+   *
+   * Объект создаётся сразу, но идентификатор назначается позже: его выдаёт
+   * signaling при входе. Пока он пустой, решения не принимаются — список без нас
+   * дал бы неверный выбор relay.
+   */
+  readonly #relay: RoomRelay;
 
   #selfId: PeerId | null = null;
   #pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -112,6 +147,81 @@ export class RoomMesh {
     this.#pingIntervalMs = opts.pingIntervalMs ?? 5_000;
     this.#maxPendingPings = opts.maxPendingPings ?? 4;
     this.#onTrace = opts.onTrace;
+    this.#relay = new RoomRelay({
+      selfId: '',
+      meshLimit: opts.meshLimit ?? DEFAULT_MESH_LIMIT,
+      enabled: opts.relay === true,
+    });
+    // Явно проговариваем решение вслух. В star лист не получает сообщения от
+    // других листьев, и в списке участников это ничем не выглядит — «на связи»
+    // горит у всех. Без такой строки поломку потом негде искать.
+    this.#onTrace?.(
+      opts.relay === true
+        ? 'relayEnabled: star-топология разрешена, пересылка трафика пока не реализована'
+        : 'relayEnabled: false, комната всегда mesh',
+    );
+  }
+
+  /**
+   * Решение о топологии: mesh или star и кто relay.
+   *
+   * Открыто наружу, потому что по нему интерфейс показывает «в комнате 12
+   * участников, трафик идёт через Диму», а тесты — проверяют, что переключение
+   * вообще происходит.
+   */
+  get relayDecision(): RelayDecision {
+    return this.#relay.decision;
+  }
+
+  /** Задать порог mesh. `0` отключает relay. */
+  setMeshLimit(limit: number): void {
+    this.#relay.setMeshLimit(limit);
+  }
+
+  /** Ручной выбор relay; null — вернуть автоматический. */
+  preferRelay(id: PeerId | null): void {
+    this.#relay.preferRelay(id);
+  }
+
+  /**
+   * Нужно ли нам создавать соединение с этим пиром.
+   *
+   * В mesh — со всеми. В star — только с relay. Проверка зеркальная: relay
+   * соединяется со всеми, лист — только с relay, поэтому соединение между
+   * листьями не создаёт никто.
+   */
+  #shouldConnect(otherId: PeerId): boolean {
+    if (this.#selfId === null) return true;
+    return shouldConnect(this.#relay.decision.topology, this.#selfId, otherId, this.#relay.decision.relayId);
+  }
+
+  /**
+   * Пересчитать топологию после изменения состава комнаты.
+   *
+   * Список участников обязано быть одинаковым у всех: он собирается из одних и
+   * тех же сообщений сервера в одном и том же порядке. Отсюда и детерминированный
+   * выбор relay без отдельных переговоров.
+   */
+  #refreshTopology(): void {
+    const members: RelayMember[] = [];
+    if (this.#selfId !== null) {
+      members.push({
+        id: this.#selfId,
+        online: true,
+        preferredRelay: this.#relay.members.find((m) => m.id === this.#selfId)?.preferredRelay ?? null,
+        overloaded: this.#relay.members.find((m) => m.id === this.#selfId)?.overloaded ?? false,
+      });
+    }
+    for (const [id, rec] of this.#peers) {
+      const known = this.#relay.members.find((m) => m.id === id);
+      members.push({
+        id,
+        online: true,
+        preferredRelay: known?.preferredRelay ?? null,
+        overloaded: known?.overloaded ?? false,
+      });
+    }
+    this.#relay.setMembers(members);
   }
 
   /** Идентификатор, присвоенный signaling-сервером этому подключению. */
@@ -236,9 +346,15 @@ export class RoomMesh {
     switch (msg.t) {
       case 'welcome': {
         this.#selfId = msg.self.id;
-        // Мы — новый участник: инициируем соединение со всеми, кто уже здесь.
+        this.#relay.setSelfId(msg.self.id);
+        for (const descriptor of msg.peers) this.#upsert(descriptor);
+        // Топология считается ДО создания соединений: иначе на девятом
+        // участнике сначала возникло бы восемь лишних пар, и только потом
+        // выяснилось бы, что половина не нужна.
+        this.#refreshTopology();
         for (const descriptor of msg.peers) {
-          this.#upsert(descriptor);
+          if (!this.#shouldConnect(descriptor.id)) continue;
+          // Мы — новый участник: инициируем соединение с теми, с кем положено.
           this.#ensureLink(descriptor.id)?.startAsOfferer().catch(() => {});
         }
         this.#startPing();
@@ -248,6 +364,8 @@ export class RoomMesh {
       }
       case 'peer-joined': {
         this.#upsert(msg.peer);
+        this.#refreshTopology();
+        if (!this.#shouldConnect(msg.peer.id)) return;
         // Существующий пир: только отвечаем на offer, свои каналы не создаём.
         this.#ensureLink(msg.peer.id);
         this.#emitPeers();
@@ -255,12 +373,18 @@ export class RoomMesh {
       }
       case 'peer-left': {
         const rec = this.#peers.get(msg.id);
+        // Порядок обязателен: сначала убираем пира из состава, и только потом
+        // пересчитываем топологию. `refreshTopology` собирает список ИЗ `#peers`,
+        // поэтому обновление до удаления вернуло бы ушедшего обратно — и перевыборы
+        // никогда бы не происходили.
+        this.#relay.remove(msg.id);
         if (rec !== undefined) {
           rec.link?.close();
           this.#peers.delete(msg.id);
           this.#queue.delete(msg.id);
-          this.#emitPeers();
         }
+        this.#refreshTopology();
+        if (rec !== undefined) this.#emitPeers();
         return;
       }
       case 'renamed': {

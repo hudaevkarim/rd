@@ -1,4 +1,5 @@
 export * from './transport.js';
+export * from './relay.js';
 export * from './emitter.js';
 export * from './channel-sender.js';
 export * from './serial-queue.js';

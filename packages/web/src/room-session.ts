@@ -252,6 +252,20 @@ export interface SessionDeps {
    * кандидаты»), и его нельзя спутать с «не задано».
    */
   iceServers?: IceServerConfig[];
+  /**
+   * До какого числа участников держим mesh.
+   *
+   * За пределами порога включается star-топология с relay. Значение `0`
+   * отключает relay полностью — так оператор может убрать посредника из
+   * комнаты любого размера, не меняя код.
+   */
+  meshLimit?: number;
+  /**
+   * Разрешить star-топологию с relay. По умолчанию выключено: выбор relay,
+   * перевыборы и соединения реализованы, пересылка трафика — нет. Подробности
+   * в `RoomMeshOptions.relay`.
+   */
+  relay?: boolean;
 }
 
 export interface SessionOptions {
@@ -437,6 +451,13 @@ export class RoomSession {
       // RTCPeerConnection вообще: `ICE_SERVERS` у оператора и `VITE_ICE_FALLBACK`
       // в сборке были двумя настройками, которые никуда не вели.
       rtcConfig: { iceServers: ice.iceServers },
+      // Порог mesh → star: пока участников не больше порога, соединения
+      // прямые, и relay не нужен вовсе.
+      ...(session.#deps.meshLimit === undefined ? {} : { meshLimit: session.#deps.meshLimit }),
+      // Star-топология включается только явным решением: пересылка трафика
+      // через relay ещё не реализована, а молча пропадающие сообщения найти
+      // невозможно.
+      ...(session.#deps.relay === undefined ? {} : { relay: session.#deps.relay }),
       // Диагностика P2P-слоя: паузы передачи из-за backpressure, таймауты
       // подтверждений, состояние рукопожатия.
       onTrace: (message) => {

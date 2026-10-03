@@ -35,6 +35,14 @@ export interface SignalTransport {
   close(): void;
   on<K extends keyof SignalTransportEvents>(event: K, handler: (p: SignalTransportEvents[K]) => void): () => void;
   readonly connected: boolean;
+  /**
+   * Описание собственного участника.
+   *
+   * Нужно для расчёта топологии: список участников известен по сообщениям
+   * сервера, но нас самих в нём нет, а relay выбирается среди всех, включая
+   * нас. Раньше это было не нужно, потому что список равнялся числу соединений.
+   */
+  readonly descriptor: PeerDescriptor;
 }
 
 // ─── Минимальный WebSocket-интерфейс (чтобы можно было подставить мок) ─────────
@@ -74,6 +82,18 @@ export class WebSocketSignalTransport implements SignalTransport {
   #socket: WebSocketLike | null = null;
   #peer: PeerDescriptor;
   #closed = false;
+
+  /**
+   * Описание собственного участника.
+   *
+   * Идентификатор неизвестен до `welcome` от сервера, поэтому отдаётся текущий:
+   * до входа он пустой, и расчёт топологии с пустым «я» просто не принимает
+   * решения. Это безопаснее, чем выдавать случайный идентификатор, который
+   * разошёлся бы с тем, что назовёт сервер.
+   */
+  get descriptor(): PeerDescriptor {
+    return this.#peer;
+  }
   #attempt = 0;
   #timer: ReturnType<typeof setTimeout> | null = null;
   readonly #wsFactory: WebSocketFactory;

@@ -39,6 +39,20 @@ export interface ServerConfig {
    */
   corsOrigin: string;
   logLevel: string;
+  /**
+   * Размер очереди входящих соединений.
+   *
+   * Node по умолчанию ставит 511. При всплеске подключений очередь
+   * переполняется, и новые соединения получают отказ вместо того, чтобы
+   * подождать в очереди. Измерение показало: на 2000 одновременных соединениях
+   * `/healthz` начинал пропускать опросы, а `ws_connecting` упирался в
+   * секунды — то есть цикл событий не успевал принимать соединения, и они
+   * отваливались на уровне ядра. Большая очередь как раз переводит отказ в
+   * ожидание.
+   *
+   * 0 означает системное значение по умолчанию (на Linux это `somaxconn`).
+   */
+  listenBacklog: number;
   /** ICE-серверы, которые клиенту понадобятся для NAT-траверса. */
   iceServers: Array<{ urls: string | string[]; username?: string; credential?: string }>;
 }
@@ -117,6 +131,7 @@ export function loadConfig(): ServerConfig {
     roomIdleEvictMs: num('ROOM_IDLE_EVICT_MS', ROOM_IDLE_EVICT_MS, 0, 3_600_000),
     corsOrigin: str('CORS_ORIGIN', '*'),
     logLevel: str('LOG_LEVEL', 'info'),
+    listenBacklog: num('LISTEN_BACKLOG', 4096, 0, 65_535),
     iceServers: iceServers(),
   };
 }

@@ -26,6 +26,7 @@ const config: ServerConfig = {
   roomIdleEvictMs: 50,
   corsOrigin: '',
   logLevel: 'silent',
+  listenBacklog: 4096,
   iceServers: [],
 };
 

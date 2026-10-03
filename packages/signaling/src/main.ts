@@ -24,7 +24,7 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
-  await server.app.listen({ host: config.host, port: config.port });
+  await server.app.listen({ host: config.host, port: config.port, backlog: config.listenBacklog });
   server.app.log.info(
     {
       publicUrl: config.publicUrl,

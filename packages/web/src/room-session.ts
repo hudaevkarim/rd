@@ -138,6 +138,15 @@ export interface PeerReading {
   progress: number;
   chapterIndex: number;
   blockIndex: number;
+  /**
+   * Какую аудиокнигу слушает сосед, id из каталога комнаты.
+   *
+   * Обязательное поле, а не выводимое из `audioTimeSec`: без него список «кто
+   * где слушает» показывал чужие позиции чужой записи. Сосед слушает вторую
+   * книгу — а у меня в плеере отмечалась его секунда в моей, потому что время
+   * было одно и то же поле у всех книг подряд.
+   */
+  audioBookId: string | null;
   /** Позиция в аудиокниге, секунды. null — сосед читает текст, а не слушает. */
   audioTimeSec: number | null;
   audioPlaying: boolean;
@@ -173,6 +182,10 @@ export interface SessionState {
    * место ни в одной из них.
    */
   positions: Record<string, BookPosition>;
+  /** Кто просит у меня книгу: id книги → список просивших. */
+  incomingRequests: Record<string, IncomingBookRequest[]>;
+  /** Мои запросы: id книги → что я запросил и что ответили. */
+  outgoingRequests: Record<string, OutgoingBookRequest>;
 }
 
 /** Позиция воспроизведения в awareness. Всё здесь приходит из сети. */
@@ -182,6 +195,29 @@ export interface RemoteAudioState {
   playing: boolean;
   follow: boolean;
   updatedAt: number;
+}
+
+/**
+ * Участник, который просит книгу у меня.
+ *
+ * Запросы живут только в памяти и только между пирами: в CRDT-документ они не
+ * попадают намеренно — это не содержимое комнаты, а личное намерение, которое
+ * должно исчезнуть вместе с вкладкой.
+ */
+export interface IncomingBookRequest {
+  peerId: string;
+  name: string;
+  color: string;
+  at: number;
+}
+
+/** Мой запрос на книгу: кому я писал и что ему ответили. */
+export interface OutgoingBookRequest {
+  bookId: string;
+  /** `requested` — ждём ответа, `declined` — отказали. */
+  status: 'requested' | 'declined';
+  reason: string;
+  at: number;
 }
 
 /** Ключ настройки в IndexedDB: персональный, не общий для комнаты. */
@@ -243,6 +279,8 @@ export class RoomSession {
     audioFollow: false,
     localFiles: [],
     positions: {},
+    incomingRequests: {},
+    outgoingRequests: {},
   };
 
   /** Заменяемое окружение. Тесты подставляют своё: см. SessionDeps. */
@@ -486,6 +524,19 @@ export class RoomSession {
       this.#patch({ safety: { ...this.state.safety, [peerId]: code } });
     });
     mesh.events.on('warning', (w) => this.#warn(w.message));
+    // Запросы и отказы по книгам. Слушаем сами, а не через FileTransferManager:
+    // запрос не привязан к передаче (transferId ещё не существует), и он
+    // приходит в том случае, когда файл у нас ЕСТЬ, — то есть передача
+    // ещё не начиналась.
+    mesh.events.on('ctrl', ({ peerId, payload }) => {
+      if (payload.kind !== 'json') return;
+      const msg = payload.msg;
+      if (msg.k === 'book-request') this.#onBookRequest(peerId, msg.bookId);
+      else if (msg.k === 'book-decline') this.#onBookDecline(peerId, msg.bookId, msg.reason);
+    });
+    // Пир вышел: его просьбы больше неактуальны, иначе кнопка «Передать» ждала
+    // бы того, кого в комнате нет.
+    mesh.events.on('peers', (peers) => this.#forgetGonePeers(peers.map((p) => p.id)));
 
     this.#doc.library.observe(() => this.#patch({ books: this.#doc.listBooks() }));
     this.#doc.comments.observeDeep(() => this.#patch({ comments: this.#comments() }));
@@ -527,6 +578,9 @@ export class RoomSession {
       // Файл докачался и лежит в IndexedDB — отмечаем сразу. Иначе кнопка
       // «передать участникам» оставалась бы скрытой до следующей перезагрузки.
       this.#markLocal(offer.bookId);
+      // Книгу получили — мой запрос к ней больше не нужен, и кнопка «Отменить
+      // запрос» исчезает сама.
+      if (direction === 'in') this.#onBookArrived(offer.bookId);
       this.#patch({ transfers: [...this.#transfersByKey.values()] });
       if (direction === 'in') this.#scheduleSave();
       if (direction === 'out' && offer.root !== '') this.#doc.patchBook(offer.bookId, { root: offer.root });
@@ -686,7 +740,7 @@ export class RoomSession {
       const s = raw as {
         user?: { name?: string; color?: string; peerId?: string };
         reading?: ReadingPosition;
-        audio?: { timeSec?: unknown; playing?: unknown };
+        audio?: { bookId?: unknown; timeSec?: unknown; playing?: unknown };
       };
       const peerId = s.user?.peerId;
       if (peerId === undefined || peerId === '') continue;
@@ -694,14 +748,19 @@ export class RoomSession {
       // числа приводим и зажимаем, а не берём как есть — иначе один мусорный
       // peerId с timeSec = NaN уронил бы перерисовку всего списка.
       const audioTime = s.audio?.timeSec;
+      // Книгу соседа берём только если она есть в нашем каталоге: иначе в
+      // плеере появился бы «слушает» для записи, которой у нас нет.
+      const audioBook = typeof s.audio?.bookId === 'string' ? s.audio.bookId : null;
+      const known = audioBook !== null && this.#doc.bookEntry(audioBook) !== undefined;
       next[peerId] = {
         name: s.user?.name ?? 'Участник',
         color: s.user?.color ?? '#8d8579',
         progress: s.reading?.progress ?? 0,
         chapterIndex: s.reading?.chapterIndex ?? 0,
         blockIndex: s.reading?.blockIndex ?? 0,
+        audioBookId: known ? audioBook : null,
         audioTimeSec:
-          typeof audioTime === 'number' && Number.isFinite(audioTime) && audioTime >= 0 ? audioTime : null,
+          known && typeof audioTime === 'number' && Number.isFinite(audioTime) && audioTime >= 0 ? audioTime : null,
         audioPlaying: s.audio?.playing === true,
       };
     }
@@ -814,12 +873,33 @@ export class RoomSession {
     return id;
   }
 
-  async shareBook(bookId: string): Promise<void> {
+  /**
+   * Передаёт книгу тем, кто её запросил.
+   *
+   * ─── Почему не «всем участникам» ─────────────────────────────────────────────
+   *
+   * Кнопка называлась «Передать участникам», а значила «всем, кто сейчас на
+   * связи», и книга уезжала каждому молча — включая тех, кто её не просил.
+   * Теперь круг передачи — ровно те, кто нажал «Запросить книгу». Если
+   * запросивших нет, это сообщается прямо, а не делается вид, что файл у кого-то
+   * скачался.
+   *
+   * @param only отправить только этому пиру. Для кнопки «Передать» рядом с
+   *   конкретным запросом: один человек запросил — ему и уходит файл.
+   */
+  async shareBook(bookId: string, only?: string): Promise<void> {
     const stored = await this.#store.getBook(this.roomId, bookId);
     const book = this.#doc.bookEntry(bookId);
     if (stored?.blob == null) throw new Error('файл книги не найден локально: его нужно получить от участника');
     if (book === undefined) throw new Error('книга не найдена в каталоге комнаты');
     if (this.#parts.mesh.readyPeerCount === 0) throw new Error('нет готовых соединений с участниками');
+
+    // Круг передачи: явный пир либо все, кто оставил запрос.
+    const requesters = this.#requestersFor(bookId);
+    const targets = only !== undefined ? [only] : [...requesters.keys()];
+    if (targets.length === 0) {
+      throw new Error('никто не просил эту книгу: сначала участник должен нажать «Запросить книгу»');
+    }
 
     const key = `out:${bookId}`;
     this.#upsertTransfer({
@@ -840,13 +920,148 @@ export class RoomSession {
       name: transferFileName(book.title, book.format, stored.mime),
       mime: stored.mime,
       source: blobSource(stored.blob) as TransferSource,
+      peers: targets,
     });
     const view = this.#transfersByKey.get(key);
     if (view !== undefined) view.transferId = offer.transferId;
+    // Отправленные запросы снимаем: файл ушёл, ждать больше нечего. Просивший
+    // увидит прогресс в списке передач.
+    this.#clearRequests(bookId, targets);
     // Контрольная сумма известна только сейчас: записываем её в общий каталог,
     // чтобы получатели проверили файл, а повторно не качали.
     this.#doc.patchBook(bookId, { root: offer.root });
     this.#patch({ transfers: [...this.#transfersByKey.values()] });
+  }
+
+  /**
+   * Просит книгу у всех участников, у которых она, вероятно, есть.
+   *
+   * Запрос уходит всем готовым соединениям: у нас нет точного знания, у кого
+   * файл лежит на диске, — это видно только по факту. Ответит тот, у кого он
+   * есть.
+   */
+  requestBook(bookId: string): void {
+    if (this.#parts.mesh.readyPeerCount === 0) {
+      this.#warn('некому отправить запрос: нет подключённых участников');
+      return;
+    }
+    for (const peerId of this.#parts.mesh.readyPeers) {
+      this.#parts.mesh.sendCtrlTo(peerId, { k: 'book-request', bookId });
+    }
+    this.state.outgoingRequests[bookId] = { bookId, status: 'requested', reason: '', at: Date.now() };
+    this.#patch({ outgoingRequests: { ...this.state.outgoingRequests } });
+  }
+
+  /** Забирает свой запрос назад. */
+  cancelBookRequest(bookId: string): void {
+    const current = this.state.outgoingRequests[bookId];
+    if (current === undefined) return;
+    for (const peerId of this.#parts.mesh.readyPeers) {
+      this.#parts.mesh.sendCtrlTo(peerId, { k: 'book-decline', bookId, reason: 'запросчик передумал' });
+    }
+    delete this.state.outgoingRequests[bookId];
+    this.#patch({ outgoingRequests: { ...this.state.outgoingRequests } });
+  }
+
+  /** Отказ владельца: запрос снимается, книга не придёт. */
+  declineBookRequest(bookId: string, peerId: string, reason = 'участник отказал в передаче'): void {
+    this.#parts.mesh.sendCtrlTo(peerId, { k: 'book-decline', bookId, reason });
+    this.#dropIncomingRequest(bookId, peerId);
+  }
+
+  /**
+   * Кто-то попросил книгу.
+   *
+   * Показываем запрос только если файл действительно есть на диске: иначе
+   * интерфейс звал бы человека нажать «Передать» с тем, чего нечего передавать.
+   */
+  #onBookRequest(peerId: string, bookId: string): void {
+    const book = this.#doc.bookEntry(bookId);
+    if (book === undefined) return; // не наш каталог — запрос не про нас
+    if (!this.#localFiles.has(bookId)) return; // нечего отдавать
+    const peer = this.state.peers.find((p) => p.id === peerId);
+    const list = this.state.incomingRequests[bookId] ?? [];
+    // Повторный запрос того же пира не должен плодить строки.
+    if (list.some((r) => r.peerId === peerId)) return;
+    this.state.incomingRequests[bookId] = [
+      ...list,
+      { peerId, name: peer?.name ?? 'Участник', color: peer?.color ?? '#8d8579', at: Date.now() },
+    ];
+    this.#patch({ incomingRequests: { ...this.state.incomingRequests } });
+  }
+
+  /**
+   * `book-decline` — одно сообщение на два смысла, и их надо различать.
+   *
+   * Отправитель — всегда тот, кто передумал:
+   *   - владелец отказал просившему → у меня есть ИСХОДЯЩИЙ запрос по этой книге,
+   *     и его надо пометить «отказали»;
+   *   - просивший забрал запрос назад → у меня есть ВХОДЯЩИЙ запрос от этого пира,
+   *     и его надо убрать.
+   *
+   * Проверка входящих идёт первой: иначе отзыв запроса не убирал бы метку у
+   * владельца, и кнопка «передать» продолжала бы звать того, кто уже передумал.
+   * Одновременно иметь входящий и исходящий запрос по одной книге нельзя —
+   * значит, порядок проверок однозначен.
+   */
+  #onBookDecline(peerId: string, bookId: string, reason: string): void {
+    const incoming = this.state.incomingRequests[bookId] ?? [];
+    if (incoming.some((r) => r.peerId === peerId)) {
+      this.#dropIncomingRequest(bookId, peerId);
+      return;
+    }
+    const current = this.state.outgoingRequests[bookId];
+    if (current === undefined) return;
+    this.state.outgoingRequests[bookId] = { ...current, status: 'declined', reason };
+    this.#patch({ outgoingRequests: { ...this.state.outgoingRequests } });
+  }
+
+  /** Убирает просьбы ушедших участников. */
+  #forgetGonePeers(alive: readonly string[]): void {
+    let changed = false;
+    const incoming: Record<string, IncomingBookRequest[]> = {};
+    for (const [bookId, list] of Object.entries(this.state.incomingRequests)) {
+      const rest = list.filter((r) => alive.includes(r.peerId));
+      if (rest.length !== list.length) changed = true;
+      if (rest.length > 0) incoming[bookId] = rest;
+    }
+    if (changed) this.#patch({ incomingRequests: incoming });
+  }
+
+  /** Кто именно просил книгу: id пира → имя для интерфейса. */
+  #requestersFor(bookId: string): Map<string, string> {
+    const out = new Map<string, string>();
+    for (const item of this.state.incomingRequests[bookId] ?? []) {
+      // Пир мог выйти: отправлять ему в пустоту бессмысленно.
+      if (!this.#parts.mesh.readyPeers.includes(item.peerId)) continue;
+      out.set(item.peerId, item.name);
+    }
+    return out;
+  }
+
+  #clearRequests(bookId: string, peerIds: readonly string[]): void {
+    const list = this.state.incomingRequests[bookId] ?? [];
+    const rest = list.filter((r) => !peerIds.includes(r.peerId));
+    if (rest.length === list.length) return;
+    if (rest.length === 0) {
+      delete this.state.incomingRequests[bookId];
+      this.#patch({ incomingRequests: { ...this.state.incomingRequests } });
+      return;
+    }
+    this.state.incomingRequests[bookId] = rest;
+    this.#patch({ incomingRequests: { ...this.state.incomingRequests } });
+  }
+
+  #dropIncomingRequest(bookId: string, peerId: string): void {
+    this.#clearRequests(bookId, [peerId]);
+  }
+
+  /** Пометить: книга дошла (файл уже на диске) — запрос снимается. */
+  #onBookArrived(bookId: string): void {
+    const current = this.state.outgoingRequests[bookId];
+    if (current === undefined) return;
+    delete this.state.outgoingRequests[bookId];
+    this.#patch({ outgoingRequests: { ...this.state.outgoingRequests } });
   }
 
   async openBook(bookId: string): Promise<ParsedEpub | null> {

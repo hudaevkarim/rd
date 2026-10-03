@@ -264,8 +264,19 @@ export class FileTransferManager {
   // ─── Отправка ────────────────────────────────────────────────────────────────
 
   /**
-   * Предлагает файл всем готовым пирам и отправляет тем, кто согласился.
+   * Предлагает файл пирам и отправляет тем, кто согласился.
    * `source` читается лениво, поэтому файл может лежать на диске.
+   *
+   * ─── Почему `peers` ограничивает круг, а не дополняет его ───────────────────
+   *
+   * Передача по требованию: файл уходит ТОЛЬКО тем, кто его запросил, и никто
+   * больше. Без ограничения `share()` слал `file-offer` всем готовым пирам, и
+   * книга молча уезжала каждому в комнате — включая тех, кто её не просил и
+   * не собирался читать. Пользователю это и не нравилось: «сейчас когда кто то
+   * делится книгой она автоматически скачивается у всех такого быть не должно».
+   *
+   * Пустой список `peers` — ошибка, а не «никому»: молча ничего не отправив,
+   * мы бы показали пользователю передачу, которой не происходит.
    */
   async share(params: {
     bookId: string;
@@ -274,6 +285,11 @@ export class FileTransferManager {
     source: TransferSource;
     /** Ссылка на объект для расчёта контрольной суммы; обычно это Blob. */
     root?: string;
+    /**
+     * Кому предлагать. `undefined` — всем готовым соединениям (так ведут себя
+     * тесты и вызовы без запроса); явный список — только им.
+     */
+    peers?: readonly PeerId[];
   }): Promise<FileOffer> {
     const transferId = newId();
     const root = params.root ?? (await computeRoot(params.source, this.#chunkSize));
@@ -288,8 +304,20 @@ export class FileTransferManager {
       root,
     };
 
-    const peers = new Set(this.#opts.mesh.readyPeers);
-    if (peers.size === 0) throw new Error('нет готовых соединений для передачи файла');
+    const ready = new Set(this.#opts.mesh.readyPeers);
+    // Пересечение с готовыми соединениями: пир мог отключиться между запросом
+    // и согласием, и писать ему в пустоту бессмысленно.
+    const peers =
+      params.peers === undefined
+        ? ready
+        : new Set(params.peers.filter((peerId) => ready.has(peerId)));
+    if (peers.size === 0) {
+      throw new Error(
+        params.peers === undefined
+          ? 'нет готовых соединений для передачи файла'
+          : 'запросивших книгу участников сейчас нет в сети',
+      );
+    }
 
     this.#failed.delete(transferId);
     this.#acked.delete(transferId);

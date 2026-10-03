@@ -38,6 +38,23 @@ export type CtrlMessage =
   | { k: 'ping'; id: number; at: number }
   | { k: 'pong'; id: number; at: number }
   | { k: 'chat'; id: string; text: string; at: number }
+  /**
+   * Запрос книги: «у меня её нет, пришлите».
+   *
+   * ─── Почему это отдельное сообщение, а не `file-offer` наоборот ──────────────
+   *
+   * Передача по требованию, а не всем подряд. Владелец файла решает, кому
+   * отправить, а получатель решает, просить ли вообще. Без отдельного запроса
+   * пришлось бы либо раздавать файл всем сразу (и он молча уезжал каждому, что
+   * пользователя и возмущало), либо вводить обратный `file-offer`, который
+   * неотличим от настоящего объявления.
+   *
+   * Запрос адресован по `bookId`, а не по `transferId`: transferId ещё
+   * неизвестен — он рождается в момент, когда владелец согласится передать.
+   */
+  | { k: 'book-request'; bookId: string }
+  /** Владелец отказал в передаче. Запрос снимается, книга не придёт. */
+  | { k: 'book-decline'; bookId: string; reason: string }
   | { k: 'file-offer'; offer: FileOffer }
   | { k: 'file-accept'; transferId: TransferId }
   | { k: 'file-decline'; transferId: TransferId; reason: string }
@@ -123,6 +140,15 @@ export function parseCtrl(bytes: Uint8Array): CtrlMessage {
       }
       if (typeof m.at !== 'number' || !Number.isFinite(m.at)) return fail('at: некорректно');
       return { k: 'chat', id: m.id, text: m.text, at: m.at };
+    }
+    case 'book-request': {
+      if (!isUuidV4(m.bookId)) return fail('bookId: некорректно');
+      return { k: 'book-request', bookId: m.bookId };
+    }
+    case 'book-decline': {
+      if (!isUuidV4(m.bookId)) return fail('bookId: некорректно');
+      if (!isString(m.reason) || m.reason.length > 200) return fail('reason: некорректно');
+      return { k: 'book-decline', bookId: m.bookId, reason: m.reason };
     }
     case 'file-offer':
       if (!isFileOffer(m.offer)) return fail('offer: некорректно');

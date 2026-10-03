@@ -218,7 +218,19 @@ function PeersPanel({ state }: { state: NonNullable<ReturnType<typeof useSession
   const byId = new Map(others.map((o) => [o.id, o]));
   const links = state.peers.map((p) => ({
     ...p,
-    reading: byId.get(p.id) ?? { name: p.name, color: p.color, progress: 0, chapterIndex: 0, blockIndex: 0 },
+    reading: byId.get(p.id) ?? {
+      name: p.name,
+      color: p.color,
+      progress: 0,
+      chapterIndex: 0,
+      blockIndex: 0,
+      // Аудиопозиции у соседа может не быть вовсе: он читает текст, а не
+      // слушает. Подставлять ноль значило бы показать чужую нулевую позицию
+      // как настоящую.
+      audioBookId: null,
+      audioTimeSec: null,
+      audioPlaying: false,
+    },
   }));
 
   return (
@@ -274,13 +286,14 @@ function LibraryPanel(props: {
   const [sharing, setSharing] = useState<string | null>(null);
 
   const share = useCallback(
-    async (bookId: string) => {
+    async (bookId: string, only?: string) => {
+      // Кнопка «передать» рядом с конкретным запросом отдаёт файл только ему.
       setSharing(bookId);
       try {
-        await props.session.shareBook(bookId);
+        await props.session.shareBook(bookId, only);
       } catch (err) {
-        // Здесь чаще всего «нет готовых соединений»: сигнал ещё идёт, либо
-        // собеседник не появился. Сообщение пользователю полезнее, чем тишина.
+        // Здесь чаще всего «никто не просил»: сигнал ещё идёт, либо никто не
+        // нажал «Запросить книгу». Сообщение пользователю полезнее, чем тишина.
         window.alert(`Передать не удалось: ${(err as Error).message}`);
       } finally {
         setSharing(null);
@@ -328,6 +341,8 @@ function LibraryPanel(props: {
           const local = localFiles.has(b.id);
           const isAudio = b.format === 'audio';
           const minutes = b.durationSec !== null && b.durationSec > 0 ? `${Math.round(b.durationSec / 60)} мин · ` : '';
+          const requesters = state?.incomingRequests[b.id] ?? [];
+          const myRequest = state?.outgoingRequests[b.id];
           return (
             <li key={b.id}>
               <button
@@ -348,19 +363,81 @@ function LibraryPanel(props: {
                 </span>
               </button>
               {local ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void share(b.id)}
+                    disabled={sharing === b.id}
+                    title={
+                      requesters.length === 0
+                        ? 'Никто не просил эту книгу — сначала участник должен нажать «Запросить книгу»'
+                        : `Передать книгу: ${requesters.map((r) => r.name).join(', ')}`
+                    }
+                    className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-md border border-accent-600/60 bg-accent-600/10 px-2 py-1.5 text-[11px] font-medium text-accent-300 transition hover:bg-accent-600/20 hover:text-accent-200 active:translate-y-px disabled:cursor-wait disabled:opacity-60"
+                  >
+                    <span aria-hidden="true">⇩</span>
+                    {sharing === b.id ? 'Передаём…' : requesters.length > 0 ? `Передать (${requesters.length})` : 'Передать'}
+                  </button>
+                  {/*
+                    Запросы, которые ждут моего ответа. Без них владелец не
+                    знал бы, что кто-то хочет книгу, и передавать было бы некому.
+                  */}
+                  {requesters.length > 0 && (
+                    <div className="mt-1 rounded-md border border-warn-500/30 bg-warn-500/5 px-2 py-1.5">
+                      <p className="text-[11px] text-warn-500">
+                        {requesters.length === 1
+                          ? `${requesters[0]?.name} хочет скачать`
+                          : `${requesters.map((r) => r.name).join(', ')} хотят скачать`}
+                      </p>
+                      <ul className="mt-1 space-y-1">
+                        {requesters.map((r) => (
+                          <li key={r.peerId} className="flex items-center gap-1.5">
+                            <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: r.color }} />
+                            <span className="flex-1 truncate text-[11px] text-ink-300">{r.name}</span>
+                            <button
+                              type="button"
+                              onClick={() => void share(b.id, r.peerId)}
+                              className="rounded border border-accent-600/60 px-1.5 py-0.5 text-[10px] text-accent-300 hover:bg-accent-600/20"
+                            >
+                              передать
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => props.session.declineBookRequest(b.id, r.peerId)}
+                              className="rounded border border-ink-700 px-1.5 py-0.5 text-[10px] text-ink-400 hover:bg-ink-800"
+                            >
+                              отказать
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </>
+              ) : myRequest !== undefined ? (
+                /* Свой запрос: его можно забрать назад. */
+                <div className="mt-1 rounded-md border border-ink-700 bg-ink-900/60 px-2 py-1.5">
+                  <p className="text-[11px] text-ink-400">
+                    {myRequest.status === 'requested' ? 'Запрос отправлен, ждём…' : `Отказали: ${myRequest.reason}`}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => props.session.cancelBookRequest(b.id)}
+                    className="mt-1 w-full rounded border border-ink-700 px-1.5 py-0.5 text-[10px] text-ink-400 hover:bg-ink-800"
+                  >
+                    Отменить запрос
+                  </button>
+                </div>
+              ) : (
+                /* Файла нет: предлагаем запросить, а не ждать милости. */
                 <button
                   type="button"
-                  onClick={() => void share(b.id)}
-                  disabled={sharing === b.id}
-                  className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-md border border-accent-600/60 bg-accent-600/10 px-2 py-1.5 text-[11px] font-medium text-accent-300 transition hover:bg-accent-600/20 hover:text-accent-200 active:translate-y-px disabled:cursor-wait disabled:opacity-60"
+                  onClick={() => props.session.requestBook(b.id)}
+                  className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-md border border-warn-500/40 bg-warn-500/10 px-2 py-1.5 text-[11px] font-medium text-warn-500 transition hover:bg-warn-500/20 hover:text-warn-300 active:translate-y-px"
                 >
                   <span aria-hidden="true">⇩</span>
-                  {sharing === b.id ? 'Передаём…' : 'Передать участникам'}
+                  Запросить книгу
                 </button>
-              ) : (
-                <p className="mt-1 rounded-md border border-warn-500/30 bg-warn-500/5 px-2 py-1.5 text-[11px] text-warn-500">
-                  Файла нет — попросите участника передать
-                </p>
               )}
             </li>
           );

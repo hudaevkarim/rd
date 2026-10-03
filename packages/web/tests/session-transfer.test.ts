@@ -109,6 +109,23 @@ function fakeFile(name: string, size: number, type: string): File {
   return Object.assign(blob, { name, lastModified: Date.now() }) as unknown as File;
 }
 
+/**
+ * Полный путь передачи по требованию: получатель просит, владелец соглашается.
+ *
+ * Вынесено, потому что порядок именно такой и нарушение его — отдельный баг
+ * (книга уезжала всем подряд, минуя запрос). Повторять его вручную в каждом
+ * тесте значило бы однажды забыть и снова получить молчаливую передачу.
+ */
+async function requestAndShare(owner: RoomSession, receiver: RoomSession, bookId: string): Promise<void> {
+  receiver.requestBook(bookId);
+  await waitFor(
+    () => (owner.state.incomingRequests[bookId] ?? []).length > 0,
+    'владелец не увидел запрос',
+    20_000,
+  );
+  await owner.shareBook(bookId);
+}
+
 describe('передача файла между настоящими сессиями', () => {
   it('доставляет аудиокнигу получателю целиком', async () => {
     const { anna, boris } = await makeSessions();
@@ -125,7 +142,8 @@ describe('передача файла между настоящими сесси
     await waitFor(() => boris.state.books.some((b) => b.id === bookId), 'каталог не синхронизирован');
     expect(boris.state.localFiles).not.toContain(bookId);
 
-    await anna.shareBook(bookId);
+    // Передача по требованию: сначала запрос, потом согласие владельца.
+    await requestAndShare(anna, boris, bookId);
 
     await waitFor(
       () => boris.state.localFiles.includes(bookId),
@@ -164,7 +182,7 @@ describe('передача файла между настоящими сесси
     const bookId = await anna.importBook(epub);
     await waitFor(() => boris.state.books.some((b) => b.id === bookId), 'каталог не синхронизирован');
 
-    await anna.shareBook(bookId);
+    await requestAndShare(anna, boris, bookId);
     await waitFor(
       () => boris.state.localFiles.includes(bookId),
       `epub не доехал; ошибки: ${boris.state.warnings.join(' | ')}`,
@@ -190,7 +208,7 @@ describe('передача файла между настоящими сесси
 
     const bookId = await anna.importBook(fakeFile(longName, 150_000, 'audio/mpeg'));
     await waitFor(() => boris.state.books.some((b) => b.id === bookId), 'каталог не синхронизирован');
-    await anna.shareBook(bookId);
+    await requestAndShare(anna, boris, bookId);
 
     await waitFor(
       () => boris.state.localFiles.includes(bookId),
@@ -242,7 +260,7 @@ describe('передача файла между настоящими сесси
     const { anna, boris } = await makeSessions();
     const bookId = await anna.importBook(fakeFile('Поздняя.mp3', 120_000, 'audio/mpeg'));
     await waitFor(() => boris.state.books.some((b) => b.id === bookId), 'каталог не синхронизирован');
-    await anna.shareBook(bookId);
+    await requestAndShare(anna, boris, bookId);
     await waitFor(() => boris.state.localFiles.includes(bookId), 'не доехало', 40_000);
   }, 90_000);
 
@@ -257,7 +275,7 @@ describe('передача файла между настоящими сесси
     ] as const) {
       const bookId = await anna.importBook(fakeFile(name, size, 'audio/mpeg'));
       await waitFor(() => boris.state.books.some((b) => b.id === bookId), `каталог не синхронизирован: ${name}`);
-      await anna.shareBook(bookId);
+      await requestAndShare(anna, boris, bookId);
       await waitFor(
         () => boris.state.localFiles.includes(bookId),
         `${name} не доехала; ошибки: ${boris.state.warnings.join(' | ')}`,
@@ -275,7 +293,7 @@ describe('передача файла между настоящими сесси
     const bookId = await anna.importBook(file);
     await waitFor(() => boris.state.books.some((b) => b.id === bookId), 'каталог не синхронизирован');
 
-    await anna.shareBook(bookId);
+    await requestAndShare(anna, boris, bookId);
     await waitFor(() => boris.state.localFiles.includes(bookId), 'не доехало', 40_000);
 
     const stored = await boris.readLocalBook(bookId);

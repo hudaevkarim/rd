@@ -92,6 +92,26 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
     [bookId, state?.comments],
   );
   const duration = player.durationSec > 0 ? player.durationSec : session.audioDuration(bookId ?? '');
+  const others = state?.others ?? {};
+
+  /**
+   * Кто слушает ОТКРЫТУЮ запись, а кто — другую.
+   *
+   * Позиция соседа показывается только в первой группе: его секунда из другой
+   * книги в нашей шкале означала бы ничего. Во второй — просто имя и название
+   * его записи, чтобы было видно, что человек в комнате и слушает, просто не
+   * то же самое.
+   */
+  const sameBook = useMemo(
+    () => Object.entries(others).filter(([, p]) => p.audioBookId !== null && p.audioBookId === bookId),
+    [bookId, others],
+  );
+  const otherBooks = useMemo(
+    () => Object.entries(others).filter(([, p]) => p.audioBookId !== null && p.audioBookId !== bookId),
+    [bookId, others],
+  );
+  const titleOf = (id: string | null): string =>
+    id === null ? '—' : state?.books.find((b) => b.id === id)?.title ?? 'другая запись';
 
   // Открываем книгу один раз на bookId.
   useEffect(() => {
@@ -150,7 +170,6 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
 
   const pct = progressPercent(snap.currentSec, snap.durationSec);
   const book = state?.books.find((b) => b.id === bookId);
-  const others = state?.others ?? {};
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-4">
@@ -245,12 +264,26 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
         )}
       </section>
 
-      {/* Присутствие */}
+      {/*
+        Присутствие.
+        ─── Почему здесь фильтр по книге ──────────────────────────────────────────
+        Список брал у соседей поле времени без оглядки на то, КАКУЮ книгу они
+        слушают. Я слушаю первую, сосед — вторую, и в моём плеере у него
+        отмечалась его секунда из его записи: цифра выглядела правдоподобно и
+        была бессмысленной. Теперь позиция показывается только у того, кто
+        слушает тот же файл, а остальные перечислены отдельно — с названием
+        своей записи.
+      */}
       {Object.keys(others).length > 0 && (
         <section className="rounded-lg border border-ink-800 bg-ink-950/40 p-3">
-          <h3 className="mb-2 text-[11px] uppercase tracking-wide text-ink-500">Сейчас слушают</h3>
+          <h3 className="mb-2 text-[11px] uppercase tracking-wide text-ink-500">
+            Сейчас слушают {sameBook.length > 0 ? `· ${sameBook.length}` : ''}
+          </h3>
+          {sameBook.length === 0 && (
+            <p className="text-[11px] text-ink-600">Эту запись сейчас никто не слушает.</p>
+          )}
           <ul className="space-y-1.5">
-            {Object.entries(others).map(([peerId, peer]) => (
+            {sameBook.map(([peerId, peer]) => (
               <li key={peerId} className="flex items-center gap-2 text-xs">
                 <span className="h-2 w-2 rounded-full" style={{ background: peer.color }} />
                 <span className="text-ink-200">{peer.name}</span>
@@ -268,6 +301,17 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
               </li>
             ))}
           </ul>
+          {otherBooks.length > 0 && (
+            <ul className="mt-2 space-y-1 border-t border-ink-800 pt-2 text-[11px] text-ink-500">
+              {otherBooks.map(([peerId, peer]) => (
+                <li key={peerId} className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full" style={{ background: peer.color }} />
+                  <span>{peer.name}</span>
+                  <span className="truncate">— {titleOf(peer.audioBookId)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
       )}
 

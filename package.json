@@ -14,13 +14,19 @@
     "packages/signaling",
     "packages/p2p",
     "packages/library",
-    "packages/web"
+    "packages/web",
+    "packages/e2e"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:e2e": "npm run test --workspace @rd/e2e",
+    "test:e2e:headed": "npm run test:headed --workspace @rd/e2e",
+    "test:e2e:ui": "npm run test:ui --workspace @rd/e2e",
+    "test:e2e:webrtc": "npm run webrtc:smoke --workspace @rd/e2e",
+    "test:e2e:install": "playwright install --with-deps chromium",
     "dev": "npm run dev --workspace @rd/web",
     "dev:server": "npm run dev --workspace @rd/signaling",
     "build:server": "npm run build --workspace @rd/signaling",

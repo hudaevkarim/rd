@@ -74,6 +74,7 @@ export function Lobby({ initialRoomId, onEnter }: LobbyProps) {
           <button
             key={m}
             type="button"
+            data-testid={m === 'create' ? 'lobby-mode-create' : 'lobby-mode-join'}
             onClick={() => setMode(m)}
             className={`flex-1 rounded-md px-3 py-2 text-sm transition ${
               mode === m ? 'bg-ink-800 text-ink-50' : 'text-ink-400 hover:text-ink-200'
@@ -93,6 +94,7 @@ export function Lobby({ initialRoomId, onEnter }: LobbyProps) {
             <div className="flex gap-2">
               <input
                 id="room-id"
+                data-testid="lobby-room-id"
                 value={roomId}
                 onChange={(e) => setRoomId(e.target.value.trim())}
                 spellCheck={false}
@@ -123,6 +125,7 @@ export function Lobby({ initialRoomId, onEnter }: LobbyProps) {
             </label>
             <input
               id="join-room"
+              data-testid="lobby-join-room"
               value={roomId}
               onChange={(e) => {
                 const value = e.target.value.trim();
@@ -143,6 +146,7 @@ export function Lobby({ initialRoomId, onEnter }: LobbyProps) {
           <div className="flex gap-2">
             <input
               id="passphrase"
+              data-testid="lobby-passphrase"
               type="password"
               autoComplete="off"
               value={passphrase}
@@ -172,6 +176,7 @@ export function Lobby({ initialRoomId, onEnter }: LobbyProps) {
           <div className="flex items-center gap-3">
             <input
               id="name"
+              data-testid="lobby-name"
               value={name}
               onChange={(e) => setName(e.target.value)}
               maxLength={40}
@@ -201,6 +206,7 @@ export function Lobby({ initialRoomId, onEnter }: LobbyProps) {
 
         <button
           type="button"
+          data-testid="lobby-enter"
           onClick={() => void enter()}
           disabled={!canEnter}
           className="w-full rounded-md bg-accent-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-600"

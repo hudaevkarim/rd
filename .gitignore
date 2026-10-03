@@ -8,6 +8,14 @@ coverage/
 packages/*/dist/
 .vite/
 
+# Артефакты сквозных UI-тестов. Каталоги генерируются заново на каждом прогоне,
+# а отчёт Playwright умеет ссылаться на исходники и картинки через относительные
+# пути — в репозитории ему не место.
+packages/e2e/test-results/
+packages/e2e/playwright-report/
+packages/e2e/blob-report/
+packages/e2e/.cache/
+
 # Артефакты упаковки и редакторов
 *.zip
 *.tsbuildinfo

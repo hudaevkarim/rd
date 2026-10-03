@@ -47,6 +47,8 @@ export function CommentsPanel({
   const [book, setBook] = useState<ParsedEpub | null>(null);
 
   const index = bookId === null ? null : session.bookIndex(bookId);
+  /** Лежит ли файл этой книги на диске — см. пояснение в reader.tsx. */
+  const hasFile = bookId !== null && session.state.localFiles.includes(bookId);
   // Именно useEffect, а не useMemo: здесь есть побочный эффект (асинхронный
   // разбор книги и setBook), а useMemo React вправе вызвать и во время рендера.
   useEffect(() => {
@@ -59,7 +61,12 @@ export function CommentsPanel({
     return () => {
       cancelled = true;
     };
-  }, [bookId, session]);
+    // `hasFile` в зависимостях — по той же причине, что и в читалке: файл книги
+    // приходит отдельной передачей позже записи в каталоге, и без этого эффект
+    // не повторялся бы после получения файла. Здесь последствие мягче (без
+    // книги якорь строится по координатам, а не по цитате), но несоответствие
+    // между панелью и читалкой сбивало бы с толку.
+  }, [bookId, hasFile, session]);
 
   /**
    * Комментарии ОТКРЫТОЙ книги.
@@ -137,7 +144,7 @@ export function CommentsPanel({
 
   return (
     <div className="flex h-full flex-col">
-      <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-ink-500">
+      <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-ink-500" data-testid="comments-count">
         Комментарии · {comments.length}
       </h2>
 
@@ -171,6 +178,7 @@ export function CommentsPanel({
             )}
             <textarea
               value={draft}
+              data-testid="comment-input"
               onChange={(e) => setDraft(e.target.value)}
               rows={3}
               placeholder="Что вы об этом думаете?"
@@ -183,6 +191,7 @@ export function CommentsPanel({
               </label>
               <button
                 type="button"
+                data-testid="comment-submit"
                 onClick={() => submit(replyTo)}
                 disabled={draft.trim() === ''}
                 className="rounded-md bg-accent-600 px-3 py-1 text-xs text-white hover:bg-accent-400 disabled:bg-ink-800 disabled:text-ink-600"
@@ -200,7 +209,7 @@ export function CommentsPanel({
                 (root.spoiler && (index === null || isSpoilerHidden(root.anchor, progress, index, session.audioDuration(root.bookId))));
               const open = revealed.has(root.id);
               return (
-                <article key={root.id} className="rounded-md border border-ink-800 bg-ink-950/40 p-2.5">
+                <article key={root.id} className="rounded-md border border-ink-800 bg-ink-950/40 p-2.5" data-testid="comment-item">
                   <Comment
                     comment={root}
                     hidden={hidden && !open}

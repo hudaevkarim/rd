@@ -118,7 +118,7 @@ export function Room({ session, onLeave }: RoomProps) {
               Выйти
             </button>
           </div>
-          <p className="flex items-center gap-2 text-xs text-ink-400">
+          <p className="flex items-center gap-2 text-xs text-ink-400" data-testid="room-status" data-status={state.status}>
             <span
               className={`inline-block h-2 w-2 rounded-full ${
                 state.status === 'connected' ? 'bg-emerald-500' : state.status === 'failed' ? 'bg-danger-500' : 'bg-warn-500'
@@ -234,16 +234,18 @@ function PeersPanel({ state }: { state: NonNullable<ReturnType<typeof useSession
   }));
 
   return (
-    <section className="space-y-2">
-      <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-500">Участники · {links.length + 1}</h2>
+    <section className="space-y-2" data-testid="peers-panel">
+      <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-500" data-testid="peers-count">
+        Участники · {links.length + 1}
+      </h2>
       <ul className="space-y-2">
-        <li className="flex items-center gap-2 text-sm text-ink-100">
+        <li className="flex items-center gap-2 text-sm text-ink-100" data-testid="peer-self">
           <Dot color="#8d8579" />
           <span className="flex-1">{self.name}</span>
           <span className="font-mono text-xs text-ink-500">{Math.round(self.progress * 100)}%</span>
         </li>
         {links.map((p) => (
-          <li key={p.id} className="space-y-1">
+          <li key={p.id} className="space-y-1" data-testid="peer-item" data-peer-id={p.id} data-peer-name={p.reading.name} data-peer-state={p.state}>
             <div className="flex items-center gap-2 text-sm text-ink-100">
               <Dot color={p.color} />
               <span className="flex-1 truncate">{p.reading.name}</span>
@@ -316,7 +318,7 @@ function LibraryPanel(props: {
   };
 
   return (
-    <section className="space-y-2">
+    <section className="space-y-2" data-testid="library-panel">
       <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-500">Книги</h2>
       <label
         className={`block cursor-pointer rounded-md border border-dashed border-ink-700 px-3 py-2 text-center text-xs text-ink-400 hover:border-accent-600 hover:text-ink-200 ${
@@ -326,6 +328,7 @@ function LibraryPanel(props: {
         {busy ? 'Читаем файл…' : '+ добавить EPUB или аудиокнигу'}
         <input
           type="file"
+          data-testid="library-file-input"
           // Аудио в списке: без него диалог выбора на некоторых системах
           // показывает только папку с изображениями.
           accept=".epub,.fb2,application/epub+zip,.mp3,.m4a,.m4b,.aac,.ogg,.opus,.flac,audio/*"
@@ -344,9 +347,10 @@ function LibraryPanel(props: {
           const requesters = state?.incomingRequests[b.id] ?? [];
           const myRequest = state?.outgoingRequests[b.id];
           return (
-            <li key={b.id}>
+            <li key={b.id} data-testid="book-item" data-book-id={b.id} data-book-format={b.format} data-book-local={String(local)}>
               <button
                 type="button"
+                data-testid="book-open"
                 onClick={() => props.onSelect(b.id)}
                 className={`w-full rounded-md border px-3 py-2 text-left text-sm transition ${
                   props.activeBook === b.id ? 'border-accent-600 bg-ink-800' : 'border-ink-800 hover:border-ink-600'
@@ -366,6 +370,7 @@ function LibraryPanel(props: {
                 <>
                   <button
                     type="button"
+                    data-testid="book-share"
                     onClick={() => void share(b.id)}
                     disabled={sharing === b.id}
                     title={
@@ -391,7 +396,7 @@ function LibraryPanel(props: {
                       </p>
                       <ul className="mt-1 space-y-1">
                         {requesters.map((r) => (
-                          <li key={r.peerId} className="flex items-center gap-1.5">
+                          <li key={r.peerId} className="flex items-center gap-1.5" data-testid="book-requester" data-peer-name={r.name}>
                             <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: r.color }} />
                             <span className="flex-1 truncate text-[11px] text-ink-300">{r.name}</span>
                             <button
@@ -432,6 +437,7 @@ function LibraryPanel(props: {
                 /* Файла нет: предлагаем запросить, а не ждать милости. */
                 <button
                   type="button"
+                  data-testid="book-request"
                   onClick={() => props.session.requestBook(b.id)}
                   className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-md border border-warn-500/40 bg-warn-500/10 px-2 py-1.5 text-[11px] font-medium text-warn-500 transition hover:bg-warn-500/20 hover:text-warn-300 active:translate-y-px"
                 >

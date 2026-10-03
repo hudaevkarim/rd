@@ -1,0 +1,72 @@
+name: Проверки
+
+# Запускается на push и на pull request. Отдельно от деплоя: этот workflow
+# ничего не публикует и не имеет прав на запись — он только говорит, зелёное ли
+# состояние.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Новое состояние не собирает результаты прошлого, но ждать своей очереди
+# продолжает: отменять раунд нельзя, он уже мог что-то попортить.
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Установить зависимости
+        run: npm ci
+
+      - name: Поставить браузер для e2e
+        # Chromium с системными библиотеками: без `--with-deps` на «голом»
+        # образе он падает на старте с невнятным сообщением о недостающей
+        # разделяемой библиотеке, и диагностика уводит в сторону.
+        run: npx playwright install --with-deps chromium
+
+      - name: Типы
+        run: npm run typecheck
+
+      - name: Модульные тесты
+        run: npm test
+
+      - name: Сборка
+        run: npm run build
+
+      - name: Сквозные UI-тесты
+        run: npm run test:e2e
+
+      # Артефакты снимаются ВСЕГДА, а не только при падении.
+      #
+      # Отчёт и трассировки нужны и при «зелёном» прогоне: иначе узнать, что
+      # именно проверял каждый тест, можно только через логи CI, а лог тестов
+      # хранится 30 дней и не показывает состояние интерфейса. При падении сюда
+      # попадают скриншоты и видео — по ним видно, что было на экране.
+      - name: Отчёт Playwright
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: packages/e2e/playwright-report
+          retention-days: 14
+
+      - name: Скриншоты, видео и трассировки
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: packages/e2e/test-results
+          retention-days: 14
+          if-no-files-found: ignore

@@ -113,11 +113,22 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
   const titleOf = (id: string | null): string =>
     id === null ? '—' : state?.books.find((b) => b.id === id)?.title ?? 'другая запись';
 
-  // Открываем книгу один раз на bookId.
+  // Открываем книгу, когда она выбрана И файл до неё дошёл.
   useEffect(() => {
     if (bookId === null) return;
-    if (openedRef.current === bookId) return;
-    openedRef.current = bookId;
+    /**
+     * Ключ включает признак наличия файла, а не только bookId.
+     *
+     * Аудиофайл приходит отдельной передачей через несколько секунд после
+     * появления записи в каталоге. Пока файла нет, `openAudio` возвращает false,
+     * и в прошлом защита `openedRef` запрещала повторную попытку навсегда: файл
+     * приходил, а на экране оставалось «Файл аудиокниги ещё не получен». Теперь
+     * ключ меняется вместе с появлением файла, и запись открывается сама — ровно
+     * то же, что пришлось чинить в читалке.
+     */
+    const key = `${bookId}:${state?.localFiles.includes(bookId) === true}`;
+    if (openedRef.current === key) return;
+    openedRef.current = key;
     let cancelled = false;
     void session
       .openAudio(bookId)
@@ -126,7 +137,7 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
     return () => {
       cancelled = true;
     };
-  }, [bookId, session]);
+  }, [bookId, session, state?.localFiles]);
 
   /**
    * Возврат на секунду, на которой остановились в ЭТОЙ аудиокниге.
@@ -146,6 +157,19 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
   }, [bookId, player, restoredFor, session]);
 
   // Слежение за соседями и публикация своей позиции.
+  //
+  // ─── Почему здесь НЕТ `snap.currentSec` в зависимостях ───────────────────────
+  //
+  // Было — и это ломало публикацию полностью. `snap.currentSec` меняется
+  // несколько раз в секунду, поэтому React пересоздавал эффект на каждом кадре и
+  // гасил недожданный `setInterval`. За 1500 мс таймер не успевал сработать ни
+  // разу: пока шло воспроизведение, позиция соседям не уходила ВООБЩЕ. На паузе
+  // (где снимок не меняется) таймер выстреливал — и поэтому синхронизация
+  // «работала» только в покое, а в живом воспроизведении молчала.
+  //
+  // Вместо снимка читается `player.positionSec` прямо в тике: это живой геттер,
+  // проблема устаревшего замыкания не возникает, а зависимости перестали
+  // меняться на каждом кадре.
   useEffect(() => {
     if (bookId === null) return;
     const offSynced = player.events.on('synced', (e) => {
@@ -154,15 +178,16 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
     });
     const timer = setInterval(() => {
       session.syncAudioPositions();
+      const current = player.positionSec;
       // Именно setAudioPosition, а не setPosition с нулями: у аудио нет ни глав,
       // ни блоков, и запись с нулями затирала бы место в главе текста.
-      session.setAudioPosition(bookId, snap.currentSec, duration > 0 ? snap.currentSec / duration : 0);
+      session.setAudioPosition(bookId, current, duration > 0 ? current / duration : 0);
     }, 1500);
     return () => {
       offSynced();
       clearInterval(timer);
     };
-  }, [bookId, duration, player, session, snap.currentSec]);
+  }, [bookId, duration, player, session]);
 
   if (bookId === null) {
     return <p className="mx-auto max-w-md pt-24 text-center text-sm text-ink-600">Выберите аудиокнигу в списке слева.</p>;
@@ -174,14 +199,15 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-4">
       {/* Плеер */}
-      <section className="rounded-lg border border-ink-800 bg-ink-950/60 p-4">
-        <h2 className="text-sm font-semibold text-ink-100">{book?.title ?? 'Аудиокнига'}</h2>
+      <section className="rounded-lg border border-ink-800 bg-ink-950/60 p-4" data-testid="audio-player">
+        <h2 className="text-sm font-semibold text-ink-100" data-testid="audio-title">{book?.title ?? 'Аудиокнига'}</h2>
         {player.currentChapter !== null && (
           <p className="mt-0.5 text-xs text-ink-500">{player.currentChapter.title}</p>
         )}
 
         <input
           type="range"
+          data-testid="audio-position"
           min={0}
           max={Math.max(1, Math.floor(snap.durationSec))}
           value={Math.floor(snap.currentSec)}
@@ -191,13 +217,14 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
         />
 
         <div className="mt-1 flex items-center justify-between text-xs text-ink-500">
-          <span className="font-mono">{formatTimecode(snap.currentSec, true)}</span>
-          <span className="font-mono">{formatDuration(snap.durationSec)}</span>
+          <span className="font-mono" data-testid="audio-current">{formatTimecode(snap.currentSec, true)}</span>
+          <span className="font-mono" data-testid="audio-duration">{formatDuration(snap.durationSec)}</span>
         </div>
 
         <div className="mt-3 flex items-center gap-3">
           <button
             type="button"
+            data-testid="audio-toggle"
             onClick={() => player.toggle()}
             className="rounded-md bg-accent-600 px-4 py-1.5 text-sm text-white hover:bg-accent-400"
           >
@@ -234,6 +261,7 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
         {/* Следующий участник */}
         <button
           type="button"
+          data-testid="audio-add-comment"
           onClick={() => onAddComment({ timeSec: snap.currentSec })}
           className="mt-3 w-full rounded-md border border-ink-800 bg-ink-900/60 px-3 py-2 text-xs text-ink-300 hover:border-accent-600"
         >
@@ -248,6 +276,7 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
         <label className="flex items-start gap-2 text-xs">
           <input
             type="checkbox"
+            data-testid="audio-follow"
             checked={follow}
             onChange={(e) => session.setAudioFollow(e.target.checked)}
           />
@@ -284,12 +313,13 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
           )}
           <ul className="space-y-1.5">
             {sameBook.map(([peerId, peer]) => (
-              <li key={peerId} className="flex items-center gap-2 text-xs">
+              <li key={peerId} className="flex items-center gap-2 text-xs" data-testid="audio-peer-same-book">
                 <span className="h-2 w-2 rounded-full" style={{ background: peer.color }} />
                 <span className="text-ink-200">{peer.name}</span>
                 {peer.audioTimeSec !== null && (
                   <button
                     type="button"
+                    data-testid="audio-peer-position"
                     onClick={() => player.seek(peer.audioTimeSec as number)}
                     className="font-mono text-ink-400 hover:text-accent-400"
                     title="Перемотать к этому участнику"
@@ -304,7 +334,7 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
           {otherBooks.length > 0 && (
             <ul className="mt-2 space-y-1 border-t border-ink-800 pt-2 text-[11px] text-ink-500">
               {otherBooks.map(([peerId, peer]) => (
-                <li key={peerId} className="flex items-center gap-2">
+                <li key={peerId} className="flex items-center gap-2" data-testid="audio-peer-other-book">
                   <span className="h-2 w-2 rounded-full" style={{ background: peer.color }} />
                   <span>{peer.name}</span>
                   <span className="truncate">— {titleOf(peer.audioBookId)}</span>
@@ -328,9 +358,10 @@ export function AudioView({ session, bookId, onAddComment }: AudioViewProps) {
                 ? isSpoilerHidden(c.anchor, snap.currentSec / duration, session.bookIndex(bookId)!, duration)
                 : false;
             return (
-              <li key={c.id} className="flex items-start gap-2 text-xs">
+              <li key={c.id} className="flex items-start gap-2 text-xs" data-testid="audio-comment-item">
                 <button
                   type="button"
+                  data-testid="audio-comment-seek"
                   onClick={() => player.seek(c.anchor.timeSec)}
                   className="shrink-0 rounded bg-ink-800 px-1.5 py-0.5 font-mono text-ink-300 hover:bg-accent-600 hover:text-white"
                   title="Перемотать к комментарию"

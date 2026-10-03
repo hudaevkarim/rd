@@ -44,6 +44,22 @@ export interface ReaderProps {
 }
 
 export function Reader({ session, bookId, index, selection, goto, onSelection, onClearSelection }: ReaderProps) {
+  /**
+   * Лежит ли файл ЭТОЙ книги на диске.
+   *
+   * Не косметика, а условие работоспособности. Книга попадает в каталог по CRDT
+   * сразу, а файл приходит отдельной передачей через несколько секунд. Пока файл
+   * не дошёл, `openBook` возвращает null, и читалка показывает «Файл книги ещё не
+   * получен». Дальше этот эффект больше не срабатывал — он зависит только от
+   * `bookId`, который не меняется, — поэтому после УСПЕШНОЙ передачи сообщение
+   * оставалось на экране, пока пользователь не нажмёт на книгу в списке второй
+   * раз. Пользователь видел «передайте файл» для файла, который уже лежит на
+   * диске.
+   *
+   * Пока файл не на месте, повторять попытку впустую тоже незачем: поэтому в
+   * зависимостях не сам факт открытия, а признак наличия файла для этой книги.
+   */
+  const hasFile = bookId !== null && session.state.localFiles.includes(bookId);
   const [chapter, setChapter] = useState<EpubChapter | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -111,7 +127,7 @@ export function Reader({ session, bookId, index, selection, goto, onSelection, o
     return () => {
       cancelled = true;
     };
-  }, [bookId, session]);
+  }, [bookId, hasFile, session]);
 
   // Рендерим главу. React здесь не нужен: блоки — это данные, а DOM строится
   // императивно. Так мы избегаем тысячи нод в vdom на длинной главе.
@@ -264,7 +280,7 @@ export function Reader({ session, bookId, index, selection, goto, onSelection, o
   return (
     <div className="mx-auto max-w-2xl">
       {notice}
-      <article ref={hostRef} className="rd-prose" onMouseUp={onMouseUp} />
+      <article ref={hostRef} className="rd-prose" data-testid="reader-host" onMouseUp={onMouseUp} />
       {chapter !== null && hasVisibleBlocks(chapter) && (
         <nav className="mx-auto mt-12 flex max-w-2xl items-center justify-between border-t border-ink-800 pt-4 text-sm">
           <button

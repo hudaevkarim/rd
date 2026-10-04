@@ -1,7 +1,7 @@
 {
   "name": "@rd/protocol",
   "version": "0.1.0",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "description": "Общий протокол: типы, валидация, бинарный фрейминг сообщений P2P-канала",

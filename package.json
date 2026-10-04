@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Децентрализованное P2P-приложение для совместного чтения книг и аудиокниг в приватных комнатах",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=20.11"
   },

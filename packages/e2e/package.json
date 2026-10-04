@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Сквозные UI-тесты: два браузерных контекста, signaling и P2P",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=20.11"
   },

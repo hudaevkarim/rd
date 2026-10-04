@@ -1,7 +1,7 @@
 {
   "name": "@rd/signaling",
   "version": "0.1.0",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "description": "Stateless signaling-сервер: только SDP/ICE и шифротекст, без хранения данных комнат",

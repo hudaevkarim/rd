@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "E2EE комнаты: PBKDF2, Ed25519, X25519 ECDH, HKDF, AES-GCM, код безопасности",
+  "license": "MIT",
   "exports": {
     ".": "./src/index.ts"
   },

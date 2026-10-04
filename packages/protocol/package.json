@@ -1,6 +1,7 @@
 {
   "name": "@rd/protocol",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "description": "Общий протокол: типы, валидация, бинарный фрейминг сообщений P2P-канала",

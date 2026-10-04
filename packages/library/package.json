@@ -1,6 +1,7 @@
 {
   "name": "@rd/library",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "description": "Локальная библиотека: EPUB/FB2-парсеры, якоря текста, движок комментариев, хранилище (Dexie)",

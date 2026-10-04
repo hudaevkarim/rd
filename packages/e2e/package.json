@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Сквозные UI-тесты: два браузерных контекста, signaling и P2P",
-  "license": "AGPL-3.0-or-later",
+  "license": "MIT",
   "engines": {
     "node": ">=20.11"
   },

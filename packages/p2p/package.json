@@ -1,6 +1,7 @@
 {
   "name": "@rd/p2p",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "description": "P2P-слой: WebRTC mesh, E2EE-каналы, Yjs-провайдер, передача файлов чанками",

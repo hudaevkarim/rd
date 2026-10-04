@@ -1,6 +1,7 @@
 {
   "name": "@rd/web",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "description": "Веб-клиент: React + Vite + Tailwind UI комнаты, читалка и аудиоплеер",

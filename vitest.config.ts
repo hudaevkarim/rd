@@ -21,6 +21,7 @@ export default defineConfig({
   test: {
     // `.tsx` нужен для тестов с DOM: без настоящей разметки не проверить, что
     // текст главы появился на странице и что `<script>` из книги не выполнился.
+    setupFiles: ['./vitest.setup.ts'],
     include: ['packages/*/tests/**/*.test.ts', 'packages/*/tests/**/*.test.tsx'],
     environment: 'node',
     testTimeout: 20_000,
